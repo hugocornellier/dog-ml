@@ -59,9 +59,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, default=Path("artifacts/dog_face_detector"))
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=8, help="Frozen-backbone epochs")
-    parser.add_argument("--finetune-epochs", type=int, default=2)
-    parser.add_argument("--finetune-last-layers", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=10, help="Frozen-backbone epochs")
+    parser.add_argument("--finetune-epochs", type=int, default=30)
+    parser.add_argument("--finetune-last-layers", type=int, default=50)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--finetune-learning-rate", type=float, default=1e-4)
     parser.add_argument("--bbox-margin", type=float, default=0.12)
@@ -213,7 +213,7 @@ def build_tf_dataset(
         image = tf.image.convert_image_dtype(image, tf.float32)
         image, box_norm = letterbox_image_and_box(image, box_abs, img_size)
         if training:
-            image, box_norm = augment_image_and_box(image, box_norm)
+            image, box_norm = augment_image_and_box(image, box_norm, img_size)
         return image, box_norm
 
     ds = ds.map(_decode_and_letterbox, num_parallel_calls=tf.data.AUTOTUNE)
@@ -246,7 +246,46 @@ def letterbox_image_and_box(
     return image_lb, box_norm
 
 
-def augment_image_and_box(image: tf.Tensor, box_xyxy: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
+def random_zoom_out(
+    image: tf.Tensor, box_xyxy: tf.Tensor, img_size: int
+) -> tuple[tf.Tensor, tf.Tensor]:
+    """Paste the letterboxed image onto a larger canvas at a random offset, then resize back.
+
+    This forces the model to learn that the dog face can appear at varying scales and
+    positions — the most common gap in pure-photometric augmentation.
+    """
+    def _zoomed() -> tuple[tf.Tensor, tf.Tensor]:
+        zoom = tf.random.uniform((), 1.3, 2.0)
+        canvas_size_f = tf.cast(img_size, tf.float32) * zoom
+        canvas_size = tf.cast(canvas_size_f, tf.int32)
+
+        max_offset = canvas_size - img_size
+        ox = tf.random.uniform((), 0, max_offset + 1, dtype=tf.int32)
+        oy = tf.random.uniform((), 0, max_offset + 1, dtype=tf.int32)
+
+        canvas = tf.image.pad_to_bounding_box(image, oy, ox, canvas_size, canvas_size)
+        canvas = tf.image.resize(canvas, [img_size, img_size], antialias=True)
+        canvas = tf.cast(tf.clip_by_value(canvas, 0.0, 1.0), tf.float32)
+
+        # Map box from [0,1] in img_size-space to [0,1] in canvas_size-space.
+        ox_f = tf.cast(ox, tf.float32)
+        oy_f = tf.cast(oy, tf.float32)
+        img_f = tf.cast(img_size, tf.float32)
+        offsets = tf.stack([ox_f, oy_f, ox_f, oy_f])
+        box_new = (box_xyxy * img_f + offsets) / canvas_size_f
+        box_new = tf.clip_by_value(box_new, 0.0, 1.0)
+        return canvas, box_new
+
+    do_zoom = tf.random.uniform(()) < 0.5
+    return tf.cond(do_zoom, _zoomed, lambda: (image, box_xyxy))
+
+
+def augment_image_and_box(
+    image: tf.Tensor, box_xyxy: tf.Tensor, img_size: int = 224
+) -> tuple[tf.Tensor, tf.Tensor]:
+    # Zoom out: vary apparent scale of the subject.
+    image, box_xyxy = random_zoom_out(image, box_xyxy, img_size)
+
     # Horizontal flip.
     do_flip = tf.random.uniform(()) < 0.5
     if do_flip:
@@ -294,12 +333,37 @@ def bbox_iou(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
     return inter / union
 
 
-def bbox_regression_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-    y_pred_ordered = order_and_clip_boxes(y_pred)
+def bbox_giou_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+    """L1 + GIoU loss. GIoU provides non-zero gradient even for non-overlapping boxes."""
+    y_pred = order_and_clip_boxes(y_pred)
     y_true = order_and_clip_boxes(y_true)
-    l1 = tf.reduce_mean(tf.abs(y_true - y_pred_ordered), axis=-1)
-    iou_term = 1.0 - bbox_iou(y_true, y_pred_ordered)
-    return l1 + iou_term
+
+    # Intersection
+    ix1 = tf.maximum(y_true[..., 0], y_pred[..., 0])
+    iy1 = tf.maximum(y_true[..., 1], y_pred[..., 1])
+    ix2 = tf.minimum(y_true[..., 2], y_pred[..., 2])
+    iy2 = tf.minimum(y_true[..., 3], y_pred[..., 3])
+    inter = tf.maximum(0.0, ix2 - ix1) * tf.maximum(0.0, iy2 - iy1)
+
+    area_t = tf.maximum(0.0, y_true[..., 2] - y_true[..., 0]) * tf.maximum(0.0, y_true[..., 3] - y_true[..., 1])
+    area_p = tf.maximum(0.0, y_pred[..., 2] - y_pred[..., 0]) * tf.maximum(0.0, y_pred[..., 3] - y_pred[..., 1])
+    union = tf.maximum(area_t + area_p - inter, 1e-8)
+    iou = inter / union
+
+    # Smallest enclosing box
+    cx1 = tf.minimum(y_true[..., 0], y_pred[..., 0])
+    cy1 = tf.minimum(y_true[..., 1], y_pred[..., 1])
+    cx2 = tf.maximum(y_true[..., 2], y_pred[..., 2])
+    cy2 = tf.maximum(y_true[..., 3], y_pred[..., 3])
+    c_area = tf.maximum((cx2 - cx1) * (cy2 - cy1), 1e-8)
+
+    giou = iou - (c_area - union) / c_area
+    l1 = tf.reduce_mean(tf.abs(y_true - y_pred), axis=-1)
+    return l1 + (1.0 - giou)
+
+
+# Alias so existing call sites that reference bbox_regression_loss still work.
+bbox_regression_loss = bbox_giou_loss
 
 
 def bbox_iou_metric(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
@@ -314,7 +378,7 @@ def build_model(img_size: int, pretrained: bool) -> tf.keras.Model:
         input_shape=(img_size, img_size, 3),
         include_top=False,
         weights=None if not pretrained else "imagenet",
-        alpha=0.5,
+        alpha=1.0,
     )
     backbone.trainable = False
     x = backbone(x, training=False)
@@ -379,7 +443,7 @@ def train_model(
             tf.keras.callbacks.EarlyStopping(
                 monitor="val_bbox_iou_metric",
                 mode="max",
-                patience=4,
+                patience=6,
                 restore_best_weights=True,
                 verbose=1,
             ),
@@ -387,7 +451,7 @@ def train_model(
                 monitor="val_bbox_iou_metric",
                 mode="max",
                 factor=0.5,
-                patience=2,
+                patience=3,
                 min_lr=1e-6,
                 verbose=1,
             ),
