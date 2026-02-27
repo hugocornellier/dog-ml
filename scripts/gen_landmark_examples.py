@@ -40,11 +40,11 @@ DATA_ROOT = (
     / "georgemartvel" / "dogflw" / "versions" / "1" / "DogFLW"
 )
 BBOX_MODEL = Path("artifacts/dog_face_detector/dog_face_localizer_224_float16.tflite")
-LM_MODEL = Path("artifacts/dog_face_landmarks/dog_face_landmarks_128_float16.tflite")
+LM_MODEL = Path("artifacts/dog_face_landmarks/dog_face_landmarks_224_float16.tflite")
 OUT_DIR = Path("artifacts/dog_face_landmarks/inference_examples")
 
 BBOX_IMG_SIZE = 224
-LM_IMG_SIZE = 128
+LM_IMG_SIZE = 224
 LM_MARGIN = 0.12
 CROP_MARGIN = 0.20
 
@@ -65,7 +65,7 @@ def make_true_image(image: Image.Image, label_path: Path) -> Image.Image:
     vis = image.copy()
     draw = ImageDraw.Draw(vis)
     draw_bbox(draw, gt_bbox, (64, 255, 64), "gt")
-    draw_landmarks(draw, gt_pts, radius=3, draw_edges=False)
+    draw_landmarks(draw, gt_pts, radius=3, draw_edges=True)
     return vis
 
 
@@ -82,7 +82,7 @@ def make_pred_image(image: Image.Image) -> Image.Image:
     vis = image.copy()
     draw = ImageDraw.Draw(vis)
     draw_bbox(draw, pred_bbox, (255, 64, 64), "pred")
-    draw_landmarks(draw, pred_pts, radius=3, draw_edges=False)
+    draw_landmarks(draw, pred_pts, radius=3, draw_edges=True)
     return vis
 
 

@@ -56,13 +56,13 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--data-root", type=Path, default=default_root)
     p.add_argument("--out-dir", type=Path, default=Path("artifacts/dog_face_landmarks"))
-    p.add_argument("--img-size", type=int, default=128,
+    p.add_argument("--img-size", type=int, default=224,
                    help="Square crop size fed to landmark model")
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--epochs", type=int, default=15,
                    help="Frozen-backbone epochs")
-    p.add_argument("--finetune-epochs", type=int, default=30)
-    p.add_argument("--finetune-last-layers", type=int, default=80)
+    p.add_argument("--finetune-epochs", type=int, default=60)
+    p.add_argument("--finetune-last-layers", type=int, default=120)
     p.add_argument("--learning-rate", type=float, default=1e-3)
     p.add_argument("--finetune-learning-rate", type=float, default=1e-4)
     p.add_argument("--lm-margin", type=float, default=0.12,
@@ -379,6 +379,34 @@ def landmark_nme(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# SWA (Stochastic Weight Averaging)
+# ---------------------------------------------------------------------------
+
+class SWACallback(tf.keras.callbacks.Callback):
+    """Collect weights from `start_epoch` onward and average them."""
+
+    def __init__(self, start_epoch: int = 0):
+        super().__init__()
+        self.start_epoch = start_epoch
+        self._weight_sum: list[np.ndarray] | None = None
+        self._count = 0
+
+    def on_epoch_end(self, epoch: int, logs=None):
+        if epoch >= self.start_epoch:
+            weights = self.model.get_weights()
+            if self._weight_sum is None:
+                self._weight_sum = [np.zeros_like(w) for w in weights]
+            for s, w in zip(self._weight_sum, weights):
+                s += w
+            self._count += 1
+
+    def get_averaged_weights(self) -> list[np.ndarray] | None:
+        if self._weight_sum is None or self._count == 0:
+            return None
+        return [s / self._count for s in self._weight_sum]
+
+
+# ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
 
@@ -387,7 +415,7 @@ def build_model(img_size: int, pretrained: bool) -> tf.keras.Model:
     # EfficientNetB0 has its own preprocessing (expects [0, 255]).
     x = tf.keras.layers.Rescaling(scale=255.0, offset=0.0, name="to_0_255")(inputs)
 
-    backbone = tf.keras.applications.EfficientNetB0(
+    backbone = tf.keras.applications.EfficientNetB2(
         input_shape=(img_size, img_size, 3),
         include_top=False,
         weights=None if not pretrained else "imagenet",
@@ -407,7 +435,7 @@ def build_model(img_size: int, pretrained: bool) -> tf.keras.Model:
     return tf.keras.Model(inputs=inputs, outputs=outputs, name="dog_face_landmark_regressor")
 
 
-def compile_model(model: tf.keras.Model, lr: float) -> None:
+def compile_model(model: tf.keras.Model, lr) -> None:
     try:
         optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=lr)
     except AttributeError:
@@ -437,30 +465,28 @@ def train_model(
     val_ds: tf.data.Dataset,
     out_dir: Path,
     args: argparse.Namespace,
+    num_train: int,
 ) -> tf.keras.Model:
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    def make_callbacks(*, append_csv: bool = False) -> list[tf.keras.callbacks.Callback]:
-        return [
-            tf.keras.callbacks.EarlyStopping(
-                monitor="val_landmark_nme",
-                mode="min",
-                patience=6,
-                restore_best_weights=True,
-                verbose=1,
-            ),
-            tf.keras.callbacks.ReduceLROnPlateau(
-                monitor="val_landmark_nme",
-                mode="min",
-                factor=0.5,
-                patience=3,
-                min_lr=1e-6,
-                verbose=1,
-            ),
-            tf.keras.callbacks.CSVLogger(
-                str(out_dir / "train_log.csv"), append=append_csv
-            ),
-        ]
+    phase1_callbacks = [
+        tf.keras.callbacks.EarlyStopping(
+            monitor="val_landmark_nme",
+            mode="min",
+            patience=6,
+            restore_best_weights=True,
+            verbose=1,
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_landmark_nme",
+            mode="min",
+            factor=0.5,
+            patience=3,
+            min_lr=1e-6,
+            verbose=1,
+        ),
+        tf.keras.callbacks.CSVLogger(str(out_dir / "train_log.csv"), append=False),
+    ]
 
     print("\n=== Phase 1: frozen backbone ===")
     compile_model(model, lr=args.learning_rate)
@@ -468,7 +494,7 @@ def train_model(
         train_ds,
         validation_data=val_ds,
         epochs=max(args.epochs, 0),
-        callbacks=make_callbacks(append_csv=False),
+        callbacks=phase1_callbacks,
         verbose=2,
     )
     p1_metrics = evaluate_model(model, val_ds)
@@ -490,20 +516,56 @@ def train_model(
             if isinstance(layer, tf.keras.layers.BatchNormalization):
                 layer.trainable = False
 
-        compile_model(model, lr=args.finetune_learning_rate)
+        # Cosine decay LR schedule
+        steps_per_epoch = math.ceil(num_train / args.batch_size)
+        total_steps = steps_per_epoch * args.finetune_epochs
+        cosine_lr = tf.keras.optimizers.schedules.CosineDecay(
+            initial_learning_rate=args.finetune_learning_rate,
+            decay_steps=total_steps,
+            alpha=1e-6,
+        )
+        compile_model(model, lr=cosine_lr)
+
+        swa_cb = SWACallback(start_epoch=args.finetune_epochs // 2)
+        phase2_callbacks = [
+            tf.keras.callbacks.EarlyStopping(
+                monitor="val_landmark_nme",
+                mode="min",
+                patience=12,
+                restore_best_weights=True,
+                verbose=1,
+            ),
+            tf.keras.callbacks.CSVLogger(
+                str(out_dir / "train_log.csv"), append=True
+            ),
+            swa_cb,
+        ]
         model.fit(
             train_ds,
             validation_data=val_ds,
             epochs=max(args.finetune_epochs, 0),
-            callbacks=make_callbacks(append_csv=True),
+            callbacks=phase2_callbacks,
             verbose=2,
         )
         p2_metrics = evaluate_model(model, val_ds)
         p2_score = float(p2_metrics.get("landmark_nme", float("inf")))
+        p2_weights = [np.array(w, copy=True) for w in model.get_weights()]
         if p2_score <= best_score:
             best_score = p2_score
             best_source = "phase2"
-            best_state = [np.array(w, copy=True) for w in model.get_weights()]
+            best_state = p2_weights
+
+        # Try SWA averaged weights
+        swa_weights = swa_cb.get_averaged_weights()
+        if swa_weights is not None:
+            model.set_weights(swa_weights)
+            swa_metrics = evaluate_model(model, val_ds)
+            swa_score = float(swa_metrics.get("landmark_nme", float("inf")))
+            print(f"SWA val_landmark_nme={swa_score:.6f}")
+            if swa_score <= best_score:
+                best_score = swa_score
+                best_source = "swa"
+                best_state = [np.array(w, copy=True) for w in swa_weights]
 
     print(f"Selecting {best_source} model (val_landmark_nme={best_score:.6f})")
     model.set_weights(best_state)
@@ -665,7 +727,8 @@ def main() -> None:
     model.summary()
 
     if not args.tflite_only:
-        model = train_model(model, train_ds, val_ds, out_dir=args.out_dir, args=args)
+        model = train_model(model, train_ds, val_ds, out_dir=args.out_dir, args=args,
+                            num_train=len(train_records))
     else:
         best_w = args.out_dir / "best.weights.h5"
         if not best_w.exists():

@@ -32,23 +32,23 @@ NUM_LANDMARKS = 46
 
 # Per-group colour and point indices
 _LM_GROUPS: list[tuple[str, tuple[int, int, int], list[int]]] = [
-    ("left_eye",   (100, 200, 255), [8, 6, 4, 2, 0, 10, 12]),   # left eye contour
-    ("right_eye",  (255, 180,  60), [9, 7, 5, 3, 1, 11, 13]),   # right eye contour
+    ("left_ear",   (100, 200, 255), [8, 6, 4, 2, 0, 10, 12]),   # left ear contour
+    ("right_ear",  (255, 180,  60), [9, 7, 5, 3, 1, 11, 13]),   # right ear contour
     ("nose_ridge", (180, 255, 100), [14, 15]),                    # nose bridge
-    ("nose_outer", (255, 255,  80), [18, 20, 22, 16, 28, 24, 29, 17, 21, 23, 19]),  # outer nose
-    ("nose_tip",   (255, 140, 220), [30, 33, 26, 32, 34, 31]),   # nose tip ring
-    ("mouth",      (255,  80,  80), [39, 36, 43, 38, 41, 42, 45, 35, 37, 40, 44]), # mouth
+    ("left_eye",   (255, 255,  80), [16, 18, 20, 22]),            # left eye
+    ("right_eye",  (255, 255,  80), [17, 19, 21, 23]),            # right eye
+    ("nose",       (255, 200,  60), [24, 28, 29]),                # nose
+    ("nose_tip",   (255, 140, 220), [25, 26, 27, 30, 31, 32, 33, 34]),  # nose tip
+    ("mouth",      (255,  80,  80), [35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45]), # mouth
 ]
 
 # Edges to draw as lines (index pairs)
 _LM_EDGES: list[tuple[tuple[int, int, int], list[tuple[int, int]]]] = [
-    ((100, 200, 255), [(8,6),(6,4),(4,2),(2,0),(0,10),(10,12),(12,8)]),   # left eye
-    ((255, 180,  60), [(9,7),(7,5),(5,3),(3,1),(1,11),(11,13),(13,9)]),   # right eye
-    ((255, 255,  80), [(18,20),(20,22),(22,16),(16,28),(28,24),           # outer nose top
-                       (24,29),(29,17),(17,21),(21,23),(23,19),(19,18)]), # outer nose bottom
-    ((255, 140, 220), [(30,33),(33,26),(26,34),(34,31),(31,30)]),          # nose tip
-    ((255,  80,  80), [(39,36),(36,43),(43,41),(41,42),(42,45),(45,38),   # mouth
-                       (38,35),(35,37),(37,40),(40,44),(44,39)]),
+    ((100, 200, 255), [(8,6),(6,4),(4,2),(2,0),(0,12),(12,10),(10,8)]),     # left ear
+    ((255, 180,  60), [(9,7),(7,5),(5,3),(3,1),(1,13),(13,11),(11,9)]),   # right ear
+    ((255, 255,  80), [(18,20),(20,16),(16,22),(22,18)]),                  # left eye
+    ((255, 255,  80), [(19,21),(21,17),(17,23),(23,19)]),                  # right eye
+
 ]
 
 
@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--landmark-model", type=Path,
-        default=Path("artifacts/dog_face_landmarks/dog_face_landmarks_128_float16.tflite"),
+        default=Path("artifacts/dog_face_landmarks/dog_face_landmarks_224_float16.tflite"),
     )
     p.add_argument("--image", type=Path, required=True)
     p.add_argument("--output-image", type=Path, default=None)
@@ -79,7 +79,7 @@ def parse_args() -> argparse.Namespace:
                    help="DogFLW label JSON for GT overlay and NME computation.")
     p.add_argument("--bbox-img-size", type=int, default=224,
                    help="Input size used by the bbox model.")
-    p.add_argument("--lm-img-size", type=int, default=128,
+    p.add_argument("--lm-img-size", type=int, default=224,
                    help="Input size used by the landmark model.")
     p.add_argument("--lm-margin", type=float, default=0.12,
                    help="Margin used to derive GT bbox from landmarks (for GT overlay).")

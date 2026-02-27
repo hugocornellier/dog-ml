@@ -60,8 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=10, help="Frozen-backbone epochs")
-    parser.add_argument("--finetune-epochs", type=int, default=30)
-    parser.add_argument("--finetune-last-layers", type=int, default=80)
+    parser.add_argument("--finetune-epochs", type=int, default=50)
+    parser.add_argument("--finetune-last-layers", type=int, default=120)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--finetune-learning-rate", type=float, default=1e-4)
     parser.add_argument("--bbox-margin", type=float, default=0.12)
@@ -389,7 +389,7 @@ def build_model(img_size: int, pretrained: bool) -> tf.keras.Model:
     # EfficientNetB0 has its own preprocessing (expects [0, 255]).
     x = tf.keras.layers.Rescaling(scale=255.0, offset=0.0, name="to_0_255")(inputs)
 
-    backbone = tf.keras.applications.EfficientNetB0(
+    backbone = tf.keras.applications.EfficientNetB2(
         input_shape=(img_size, img_size, 3),
         include_top=False,
         weights=None if not pretrained else "imagenet",
@@ -406,7 +406,7 @@ def build_model(img_size: int, pretrained: bool) -> tf.keras.Model:
     return model
 
 
-def compile_model(model: tf.keras.Model, lr: float) -> None:
+def compile_model(model: tf.keras.Model, lr) -> None:
     try:
         optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=lr)
     except AttributeError:
@@ -434,6 +434,7 @@ def train_model(
     val_ds: tf.data.Dataset,
     out_dir: Path,
     args: argparse.Namespace,
+    num_train: int,
 ) -> tf.keras.Model:
     out_dir.mkdir(parents=True, exist_ok=True)
     phase1_model_path = out_dir / "phase1_best.keras"
@@ -453,25 +454,24 @@ def train_model(
             if stale.is_file():
                 stale.unlink()
 
-    def make_callbacks(*, append_csv: bool = False) -> list[tf.keras.callbacks.Callback]:
-        return [
-            tf.keras.callbacks.EarlyStopping(
-                monitor="val_bbox_iou_metric",
-                mode="max",
-                patience=6,
-                restore_best_weights=True,
-                verbose=1,
-            ),
-            tf.keras.callbacks.ReduceLROnPlateau(
-                monitor="val_bbox_iou_metric",
-                mode="max",
-                factor=0.5,
-                patience=3,
-                min_lr=1e-6,
-                verbose=1,
-            ),
-            tf.keras.callbacks.CSVLogger(str(out_dir / "train_log.csv"), append=append_csv),
-        ]
+    phase1_callbacks = [
+        tf.keras.callbacks.EarlyStopping(
+            monitor="val_bbox_iou_metric",
+            mode="max",
+            patience=6,
+            restore_best_weights=True,
+            verbose=1,
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_bbox_iou_metric",
+            mode="max",
+            factor=0.5,
+            patience=3,
+            min_lr=1e-6,
+            verbose=1,
+        ),
+        tf.keras.callbacks.CSVLogger(str(out_dir / "train_log.csv"), append=False),
+    ]
 
     print("\n=== Phase 1: frozen backbone ===")
     compile_model(model, lr=args.learning_rate)
@@ -479,7 +479,7 @@ def train_model(
         train_ds,
         validation_data=val_ds,
         epochs=max(args.epochs, 0),
-        callbacks=make_callbacks(append_csv=False),
+        callbacks=phase1_callbacks,
         verbose=2,
     )
     phase1_metrics = evaluate_model(model, val_ds)
@@ -505,12 +505,38 @@ def train_model(
             if isinstance(layer, tf.keras.layers.BatchNormalization):
                 layer.trainable = False
 
-        compile_model(model, lr=args.finetune_learning_rate)
+        # Cosine decay LR schedule
+        steps_per_epoch = math.ceil(num_train / args.batch_size)
+        total_steps = steps_per_epoch * args.finetune_epochs
+        cosine_lr = tf.keras.optimizers.schedules.CosineDecay(
+            initial_learning_rate=args.finetune_learning_rate,
+            decay_steps=total_steps,
+            alpha=1e-6,
+        )
+        compile_model(model, lr=cosine_lr)
+
+        phase2_callbacks = [
+            tf.keras.callbacks.ModelCheckpoint(
+                str(phase2_model_path),
+                monitor="val_bbox_iou_metric",
+                mode="max",
+                save_best_only=True,
+                verbose=1,
+            ),
+            tf.keras.callbacks.EarlyStopping(
+                monitor="val_bbox_iou_metric",
+                mode="max",
+                patience=10,
+                restore_best_weights=True,
+                verbose=1,
+            ),
+            tf.keras.callbacks.CSVLogger(str(out_dir / "train_log.csv"), append=True),
+        ]
         model.fit(
             train_ds,
             validation_data=val_ds,
             epochs=max(args.finetune_epochs, 0),
-            callbacks=make_callbacks(append_csv=True),
+            callbacks=phase2_callbacks,
             verbose=2,
         )
         phase2_metrics = evaluate_model(model, val_ds)
@@ -700,7 +726,8 @@ def main() -> None:
     model.summary()
 
     if not args.tflite_only:
-        model = train_model(model, train_ds, val_ds, out_dir=args.out_dir, args=args)
+        model = train_model(model, train_ds, val_ds, out_dir=args.out_dir, args=args,
+                            num_train=len(train_records))
         model.save(args.out_dir / "final.keras")
     else:
         best_weights = args.out_dir / "best.weights.h5"
