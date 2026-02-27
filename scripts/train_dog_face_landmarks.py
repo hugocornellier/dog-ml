@@ -62,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=15,
                    help="Frozen-backbone epochs")
     p.add_argument("--finetune-epochs", type=int, default=30)
-    p.add_argument("--finetune-last-layers", type=int, default=40)
+    p.add_argument("--finetune-last-layers", type=int, default=80)
     p.add_argument("--learning-rate", type=float, default=1e-3)
     p.add_argument("--finetune-learning-rate", type=float, default=1e-4)
     p.add_argument("--lm-margin", type=float, default=0.12,
@@ -201,8 +201,12 @@ def build_tf_dataset(
         img_bytes = tf.io.read_file(path)
         image = tf.io.decode_png(img_bytes, channels=3)
         image = tf.image.convert_image_dtype(image, tf.float32)
-        crop, lm_norm = crop_and_normalize(image, box_abs, lm_flat, img_size, crop_margin)
+        box_aug = box_abs
         if training:
+            box_aug = jitter_crop_box(box_abs, image)
+        crop, lm_norm = crop_and_normalize(image, box_aug, lm_flat, img_size, crop_margin)
+        if training:
+            crop, lm_norm = rotate_augment(crop, lm_norm, img_size)
             crop = photometric_augment(crop)
         return crop, lm_norm
 
@@ -264,6 +268,74 @@ def crop_and_normalize(
     return resized, lm_norm_flat
 
 
+def jitter_crop_box(
+    bbox_abs: tf.Tensor, image: tf.Tensor, max_frac: float = 0.05
+) -> tf.Tensor:
+    """Randomly shift the crop box by up to ±max_frac of its width/height.
+
+    Simulates the imperfect bboxes the landmark model will receive from the
+    detector at inference time.
+    """
+    img_h = tf.cast(tf.shape(image)[0], tf.float32)
+    img_w = tf.cast(tf.shape(image)[1], tf.float32)
+    x1, y1, x2, y2 = bbox_abs[0], bbox_abs[1], bbox_abs[2], bbox_abs[3]
+    bw, bh = x2 - x1, y2 - y1
+    dx = tf.random.uniform((), -max_frac, max_frac) * bw
+    dy = tf.random.uniform((), -max_frac, max_frac) * bh
+    x1 = tf.clip_by_value(x1 + dx, 0.0, img_w)
+    y1 = tf.clip_by_value(y1 + dy, 0.0, img_h)
+    x2 = tf.clip_by_value(x2 + dx, 0.0, img_w)
+    y2 = tf.clip_by_value(y2 + dy, 0.0, img_h)
+    return tf.stack([x1, y1, x2, y2])
+
+
+def rotate_augment(
+    crop: tf.Tensor, lm_norm_flat: tf.Tensor, img_size: int,
+    max_deg: float = 15.0,
+) -> tuple[tf.Tensor, tf.Tensor]:
+    """Random rotation of the crop with corresponding landmark transform."""
+    angle_deg = tf.random.uniform((), -max_deg, max_deg)
+    angle_rad = angle_deg * (math.pi / 180.0)
+
+    # Rotate image about its centre.
+    crop = tf.expand_dims(crop, 0)  # [1, H, W, 3]
+    # angles is counter-clockwise in radians
+    crop = tf.raw_ops.ImageProjectiveTransformV3(
+        images=crop,
+        transforms=_rotation_matrix(angle_rad, img_size),
+        output_shape=tf.constant([img_size, img_size], dtype=tf.int32),
+        interpolation="BILINEAR",
+        fill_mode="NEAREST",
+        fill_value=0.0,
+    )
+    crop = tf.squeeze(crop, 0)
+    crop = tf.clip_by_value(crop, 0.0, 1.0)
+
+    # Rotate landmarks (pivot = centre of unit square).
+    lm = tf.reshape(lm_norm_flat, [NUM_LANDMARKS, 2])
+    cos_a = tf.cos(-angle_rad)
+    sin_a = tf.sin(-angle_rad)
+    cx = lm[:, 0] - 0.5
+    cy = lm[:, 1] - 0.5
+    rx = cx * cos_a - cy * sin_a + 0.5
+    ry = cx * sin_a + cy * cos_a + 0.5
+    lm_rot = tf.clip_by_value(tf.stack([rx, ry], axis=-1), 0.0, 1.0)
+    return crop, tf.reshape(lm_rot, [NUM_LANDMARKS * 2])
+
+
+def _rotation_matrix(angle_rad: tf.Tensor, img_size: int) -> tf.Tensor:
+    """Build a [1, 8] projective transform matrix for tf.raw_ops.ImageProjectiveTransformV3."""
+    cos_a = tf.cos(angle_rad)
+    sin_a = tf.sin(angle_rad)
+    half = tf.cast(img_size, tf.float32) / 2.0
+    # Translate to origin, rotate, translate back.
+    tx = half - half * cos_a + half * sin_a
+    ty = half - half * sin_a - half * cos_a
+    return tf.expand_dims(
+        tf.stack([cos_a, -sin_a, tx, sin_a, cos_a, ty, 0.0, 0.0]), 0
+    )
+
+
 def photometric_augment(image: tf.Tensor) -> tf.Tensor:
     image = tf.image.random_brightness(image, max_delta=0.10)
     image = tf.image.random_contrast(image, lower=0.80, upper=1.20)
@@ -312,20 +384,21 @@ def landmark_nme(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
 
 def build_model(img_size: int, pretrained: bool) -> tf.keras.Model:
     inputs = tf.keras.Input(shape=(img_size, img_size, 3), name="crop")
-    x = tf.keras.layers.Rescaling(scale=2.0, offset=-1.0, name="to_m1_p1")(inputs)
+    # EfficientNetB0 has its own preprocessing (expects [0, 255]).
+    x = tf.keras.layers.Rescaling(scale=255.0, offset=0.0, name="to_0_255")(inputs)
 
-    backbone = tf.keras.applications.MobileNetV2(
+    backbone = tf.keras.applications.EfficientNetB0(
         input_shape=(img_size, img_size, 3),
         include_top=False,
         weights=None if not pretrained else "imagenet",
-        alpha=1.0,
     )
     backbone.trainable = False
     x = backbone(x, training=False)
 
     x = tf.keras.layers.GlobalAveragePooling2D()(x)
+    x = tf.keras.layers.Dense(1024, activation="relu")(x)
+    x = tf.keras.layers.Dropout(0.25)(x)
     x = tf.keras.layers.Dense(512, activation="relu")(x)
-    x = tf.keras.layers.Dropout(0.20)(x)
     x = tf.keras.layers.Dense(256, activation="relu")(x)
     outputs = tf.keras.layers.Dense(
         NUM_LANDMARKS * 2, activation="sigmoid", name="landmarks_xy"
@@ -349,9 +422,9 @@ def compile_model(model: tf.keras.Model, lr: float) -> None:
 
 def get_backbone(model: tf.keras.Model) -> tf.keras.Model:
     for layer in model.layers:
-        if isinstance(layer, tf.keras.Model) and layer.name.startswith("mobilenetv2"):
+        if isinstance(layer, tf.keras.Model) and layer.name.startswith("efficientnet"):
             return layer
-    raise RuntimeError("MobileNetV2 backbone not found")
+    raise RuntimeError("EfficientNet backbone not found")
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +602,7 @@ def save_metadata(
             "shape": [1, img_size, img_size, 3],
             "dtype": "float32",
             "range": [0.0, 1.0],
-            "preprocessing": "crop to GT/pred bbox + margin, resize to square, rescale to [-1,1] in-model",
+            "preprocessing": "crop to GT/pred bbox + margin, resize to square, rescale to [0,255] for EfficientNetB0 in-model",
         },
         "output": {
             "name": "landmarks_xy",

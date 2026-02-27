@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=10, help="Frozen-backbone epochs")
     parser.add_argument("--finetune-epochs", type=int, default=30)
-    parser.add_argument("--finetune-last-layers", type=int, default=50)
+    parser.add_argument("--finetune-last-layers", type=int, default=80)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--finetune-learning-rate", type=float, default=1e-4)
     parser.add_argument("--bbox-margin", type=float, default=0.12)
@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-pretrained",
         action="store_true",
-        help="Do not load ImageNet weights for the MobileNet backbone.",
+        help="Do not load ImageNet weights for the EfficientNet backbone.",
     )
     parser.add_argument(
         "--skip-finetune",
@@ -333,8 +333,8 @@ def bbox_iou(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
     return inter / union
 
 
-def bbox_giou_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-    """L1 + GIoU loss. GIoU provides non-zero gradient even for non-overlapping boxes."""
+def bbox_ciou_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+    """L1 + CIoU loss.  Adds center-distance and aspect-ratio penalties over GIoU."""
     y_pred = order_and_clip_boxes(y_pred)
     y_true = order_and_clip_boxes(y_true)
 
@@ -350,20 +350,34 @@ def bbox_giou_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
     union = tf.maximum(area_t + area_p - inter, 1e-8)
     iou = inter / union
 
-    # Smallest enclosing box
+    # Smallest enclosing box diagonal squared
     cx1 = tf.minimum(y_true[..., 0], y_pred[..., 0])
     cy1 = tf.minimum(y_true[..., 1], y_pred[..., 1])
     cx2 = tf.maximum(y_true[..., 2], y_pred[..., 2])
     cy2 = tf.maximum(y_true[..., 3], y_pred[..., 3])
-    c_area = tf.maximum((cx2 - cx1) * (cy2 - cy1), 1e-8)
+    c_diag_sq = tf.maximum((cx2 - cx1) ** 2 + (cy2 - cy1) ** 2, 1e-8)
 
-    giou = iou - (c_area - union) / c_area
+    # Center distance squared
+    ct_x = (y_true[..., 0] + y_true[..., 2]) / 2.0
+    ct_y = (y_true[..., 1] + y_true[..., 3]) / 2.0
+    cp_x = (y_pred[..., 0] + y_pred[..., 2]) / 2.0
+    cp_y = (y_pred[..., 1] + y_pred[..., 3]) / 2.0
+    rho_sq = (ct_x - cp_x) ** 2 + (ct_y - cp_y) ** 2
+
+    # Aspect-ratio consistency (Zheng et al., 2020)
+    w_t = tf.maximum(y_true[..., 2] - y_true[..., 0], 1e-8)
+    h_t = tf.maximum(y_true[..., 3] - y_true[..., 1], 1e-8)
+    w_p = tf.maximum(y_pred[..., 2] - y_pred[..., 0], 1e-8)
+    h_p = tf.maximum(y_pred[..., 3] - y_pred[..., 1], 1e-8)
+    v = (4.0 / (math.pi ** 2)) * tf.square(tf.atan(w_t / h_t) - tf.atan(w_p / h_p))
+    alpha = v / tf.maximum(1.0 - iou + v, 1e-8)
+
+    ciou = iou - rho_sq / c_diag_sq - alpha * v
     l1 = tf.reduce_mean(tf.abs(y_true - y_pred), axis=-1)
-    return l1 + (1.0 - giou)
+    return l1 + (1.0 - ciou)
 
 
-# Alias so existing call sites that reference bbox_regression_loss still work.
-bbox_regression_loss = bbox_giou_loss
+bbox_regression_loss = bbox_ciou_loss
 
 
 def bbox_iou_metric(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
@@ -372,19 +386,20 @@ def bbox_iou_metric(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
 
 def build_model(img_size: int, pretrained: bool) -> tf.keras.Model:
     inputs = tf.keras.Input(shape=(img_size, img_size, 3), name="image")
-    x = tf.keras.layers.Rescaling(scale=2.0, offset=-1.0, name="to_m1_p1")(inputs)
+    # EfficientNetB0 has its own preprocessing (expects [0, 255]).
+    x = tf.keras.layers.Rescaling(scale=255.0, offset=0.0, name="to_0_255")(inputs)
 
-    backbone = tf.keras.applications.MobileNetV2(
+    backbone = tf.keras.applications.EfficientNetB0(
         input_shape=(img_size, img_size, 3),
         include_top=False,
         weights=None if not pretrained else "imagenet",
-        alpha=1.0,
     )
     backbone.trainable = False
     x = backbone(x, training=False)
     x = tf.keras.layers.GlobalAveragePooling2D()(x)
+    x = tf.keras.layers.Dense(512, activation="relu")(x)
+    x = tf.keras.layers.Dropout(0.20)(x)
     x = tf.keras.layers.Dense(256, activation="relu")(x)
-    x = tf.keras.layers.Dropout(0.15)(x)
     x = tf.keras.layers.Dense(128, activation="relu")(x)
     outputs = tf.keras.layers.Dense(4, activation="sigmoid", name="bbox_xyxy")(x)
     model = tf.keras.Model(inputs=inputs, outputs=outputs, name="dog_face_localizer")
@@ -408,9 +423,9 @@ def compile_model(model: tf.keras.Model, lr: float) -> None:
 
 def get_backbone(model: tf.keras.Model) -> tf.keras.Model:
     for layer in model.layers:
-        if isinstance(layer, tf.keras.Model) and layer.name.startswith("mobilenetv2"):
+        if isinstance(layer, tf.keras.Model) and layer.name.startswith("efficientnet"):
             return layer
-    raise RuntimeError("MobileNetV2 backbone not found in model")
+    raise RuntimeError("EfficientNet backbone not found in model")
 
 
 def train_model(
@@ -597,7 +612,7 @@ def save_metadata(
             "shape": [1, img_size, img_size, 3],
             "dtype": "float32",
             "range": [0.0, 1.0],
-            "preprocessing": "letterbox to square, then rescale to [-1, 1] in-model",
+            "preprocessing": "letterbox to square, then rescale to [0, 255] for EfficientNetB0 in-model",
         },
         "output": {
             "name": "bbox_xyxy",
