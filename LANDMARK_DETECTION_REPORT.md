@@ -1,6 +1,6 @@
 # Dog Facial Landmark Detection: Progress Journal
 
-**Current best: NME_IOD = 10.14 (with TTA) / 10.58 (without TTA) | Target: 6.52 (paper) | Started at: ~40**
+**Current best: NME_IOD = 9.11 (with TTA) / 9.53 (without TTA) | Target: 6.52 (paper) | Started at: ~40**
 
 This document is a living journal of our work improving dog facial landmark detection. It's designed for future LLMs/developers to pick up where we left off and continue pushing toward the paper's target.
 
@@ -9,13 +9,13 @@ This document is a living journal of our work improving dog facial landmark dete
 ## Quick Reference
 
 ### Current Best Model
-- **Preset**: `heatmap_v2s_112`
-- **Val NME_IOD**: 10.58 (no TTA) / **10.14** (with flip-TTA)
+- **Preset**: `tight_margin`
+- **Val NME_IOD**: 9.53 (no TTA) / **9.11** (with flip-TTA)
 - **Architecture**: EfficientNetV2S + **4-deconv** heatmap head (112x112) + SoftArgmax2D
-- **Key improvements over Round 1**: heatmap head, 4th deconv layer (112x112), horizontal flip augmentation, scale augmentation, AdamW, two-phase backbone fine-tuning, flip-TTA
-- **Artifacts**: `artifacts/heatmap_v2s_112/`
-- **TFLite**: `artifacts/dog_face_landmarks/dog_face_landmarks_224_float16.tflite` (55 MB)
-- **Previous best**: `heatmap_v2s_best` at NME_IOD 10.72 (artifacts in `artifacts/heatmap_v2s_best/`)
+- **Key change from previous best**: tighter crop margin (10% vs 20%), tighter landmark bbox margin (5% vs 12%)
+- **Artifacts**: `artifacts/tight_margin/`
+- **TFLite**: `artifacts/tight_margin/dog_face_landmarks_224_float16.tflite` (55 MB)
+- **Previous best**: `heatmap_v2s_112` at NME_IOD 10.58 / 10.14 with TTA (artifacts in `artifacts/heatmap_v2s_112/`)
 
 ### Key Commands
 ```bash
@@ -30,6 +30,12 @@ python scripts/gen_landmark_examples.py
 
 # Run automated NME push experiments
 python scripts/run_nme_push.py
+
+# Run NME push v2 experiments (tight margin, mixup, pure heatmap, combined)
+python scripts/run_nme_push_v2.py
+
+# Evaluate existing model with different SoftArgmax temperatures / multi-scale TTA
+python scripts/eval_experiments.py
 
 # Quick smoke test (5 epochs)
 python scripts/train_dog_face_landmarks.py --experiment heatmap_v2s_112 --epochs 5 --patience 50 --out artifacts/smoke
@@ -163,17 +169,61 @@ EfficientNetV2S (frozen, 224x224)
 - **Do not retry heatmap supervision unless the approach is fundamentally redesigned** (e.g., detached gradient, separate heatmap head with stop_gradient, or pre-train heatmaps then switch to coord-only)
 - Keras metric naming gotcha: multi-output models prefix metrics with the OUTPUT LAYER NAME (e.g., `val_landmarks_xy_landmark_nme_iod`), NOT the dict key (not `val_xy_landmark_nme_iod`). This caused silent EarlyStopping/ReduceLROnPlateau failures in early experiments.
 
+### Round 5: Crop Margin + Regularization Experiments (NME_IOD ~9.1)
+
+Deep analysis session combining our own diagnosis with Codex/GPT-5.3 consultation identified three root causes for the 10.14 → 6.52 gap:
+
+1. **Excessive crop margin** — our preprocessing used `lm_margin=0.12` (12% padding around landmark bounding box) + `crop_margin=0.20` (20% expansion around that), resulting in ~32% total padding. The DogFLW paper uses only ~10% surrounding space. This wastes ~2x effective resolution on background.
+2. **Coordinate-through-SoftArgmax training** — our model trains MSE on coordinates extracted via SoftArgmax2D (spatial softmax + weighted sum). DeepLabCut and other top methods train directly on heatmap MSE, which provides denser gradient signal per landmark.
+3. **Overfitting** — train-val gap of 4.48 points (train 6.1 vs val 10.58) with only 3,853 training images across 120 breeds.
+
+Used `scripts/run_nme_push_v2.py` to run experiments sequentially. Also added new features to the training script:
+- **SoftArgmax2D temperature (beta)**: scales logits before softmax, making peaks sharper. `SoftArgmax2D(beta=40)` for 112x112 heatmaps.
+- **Mixup augmentation**: blends pairs of training images and landmark coordinates. `aug_mixup=True, aug_mixup_alpha=0.2, aug_mixup_prob=0.4`.
+- **Random erasing**: masks random rectangular regions during training. `aug_random_erase=True, aug_random_erase_prob=0.25`.
+- **Pure heatmap supervision**: trains directly on Gaussian heatmap targets with MSE, bypassing SoftArgmax2D during training (still used at inference for TFLite export).
+
+| # | Experiment | NME_IOD | + TTA | Time | Notes |
+|---|---|---|---|---|---|
+| 1 | **tight_margin** | **9.53** | **9.11** | 2h 45m | **NEW BEST** — single digits! |
+| 2 | tight_margin_mixup | ~10.4 | (interrupted) | ~3h | Mixup too aggressive, underfitting |
+| 3 | pure_heatmap | — | — | — | Not reached (computer crash) |
+| 4 | combined_best | — | — | — | Not reached (computer crash) |
+
+**Key learnings**:
+
+**Tight crop margin (breakthrough)**:
+- Reducing `lm_margin` from 0.12 → 0.05 and `crop_margin` from 0.20 → 0.10 dropped NME from 10.58 → 9.53 (no TTA), or 10.14 → 9.11 (with TTA)
+- This was the **single most impactful change since adding the heatmap head** (~1 full NME point)
+- The model now sees ~2x more face detail at the same 224x224 input resolution — previously half the pixels were wasted on background/body
+- Train-val gap reduced from 4.48 → 3.53 (train 5.95 vs val 9.53), suggesting the model now has more useful signal to learn from
+- Phase 2 fine-tuning ran all 200 epochs without early stopping — the model was still slowly improving at termination
+
+**Mixup augmentation (did not help)**:
+- Mixup (alpha=0.2, p=0.4) + Random Erasing (p=0.25) was tested on top of tight margins
+- Dramatically reduced overfitting: train-val gap dropped to ~0.5 (vs 3.5 without mixup)
+- But absolute val NME was significantly worse (~10.4 vs 9.53) — the model was underfitting
+- Mixup makes training data harder by blending images, which prevents the model from learning fine-grained landmark positions
+- **Conclusion**: For small datasets where overfitting comes from limited data diversity (not model capacity), mixup may hurt more than it helps. The model needs to learn precise spatial features, and blending destroys that precision.
+- Might work with lower probability (p=0.1-0.2) or only during early training
+
+**Pure heatmap supervision & combined_best**:
+- These experiments were queued but not reached due to computer interruption
+- Still worth trying — pure heatmap MSE supervision (different from the earlier failed dual-loss approach) trains on Gaussian targets directly, which is how DeepLabCut achieves 6.70
+- Key difference from Round 4's failed attempt: pure heatmap supervision has NO coordinate loss branch at all during training. The SoftArgmax2D is only attached for inference/export. This avoids the gradient interference that killed the dual-loss approach.
+
 ---
 
 ## What Worked (Ranked by Impact)
 
 1. **Heatmap head replacing GAP+Dense** — 40 -> 12 (3x improvement, the breakthrough)
-2. **Horizontal flip augmentation** — 12 -> 11.7 (halves overfitting gap)
-3. **Two-phase backbone fine-tuning** — 11.7 -> 10.7 (adapts features to task)
-4. **Flip-TTA at inference** — 10.7 -> 10.25, 10.58 -> 10.14 (~0.4-0.5 free gain)
-5. **112x112 heatmaps (4th deconv)** — 10.72 -> 10.58 (modest resolution gain)
-6. **Scale augmentation** — modest but synergistic with flip
-7. **AdamW optimizer** — slight improvement over Adam
+2. **Tight crop margin** — 10.58 -> 9.53, 10.14 -> 9.11 with TTA (~1 point improvement). Reduced `lm_margin` from 0.12 to 0.05 and `crop_margin` from 0.20 to 0.10. Gives the model 2x more face pixels.
+3. **Horizontal flip augmentation** — 12 -> 11.7 (halves overfitting gap)
+4. **Two-phase backbone fine-tuning** — 11.7 -> 10.7 (adapts features to task)
+5. **Flip-TTA at inference** — 10.7 -> 10.25, 9.53 -> 9.11 (~0.4-0.5 free gain)
+6. **112x112 heatmaps (4th deconv)** — 10.72 -> 10.58 (modest resolution gain)
+7. **Scale augmentation** — modest but synergistic with flip
+8. **AdamW optimizer** — slight improvement over Adam
 
 ## What Didn't Work
 
@@ -183,6 +233,7 @@ EfficientNetV2S (frozen, 224x224)
 4. **SpatialDropout2D** — negligible improvement (12.25 vs 12.18)
 5. **Dense head fine-tuning** — fragile, collapsed at any LR > 1e-6
 6. **Crop jitter alone** — minimal impact without flip/scale
+7. **Mixup augmentation (alpha=0.2, p=0.4)** — reduced overfitting dramatically (gap from 3.5 to 0.5) but caused underfitting. Val NME ~10.4 vs 9.53 without mixup. The blending destroys fine-grained spatial precision needed for landmark detection.
 
 ---
 
@@ -195,6 +246,7 @@ The single biggest obstacle to reaching single digits is the **train-val gap**. 
 | heatmap_v2s (frozen, no aug) | 4.19 | 12.18 | 7.99 |
 | heatmap_v2s_best (flip+scale) | 7.46 | 10.72 | 3.26 |
 | heatmap_v2s_112 (current best) | 6.10 | 10.58 | 4.48 |
+| tight_margin (current best) | 5.95 | 9.53 | 3.58 |
 
 The model can fit training data to NME ~6 but generalizes to only ~10.5. The 3,853 training images across 120 breeds (only ~32 images per breed) are insufficient for the model to generalize well. Key observations:
 - Augmentation cuts the gap significantly (8.0 -> 3.3 with flip+scale)
@@ -211,7 +263,7 @@ The model can fit training data to NME ~6 but generalizes to only ~10.5. The 3,8
 
 ---
 
-## Remaining Gap: 10.14 -> 6.52
+## Remaining Gap: 9.11 -> 6.52
 
 ### What the paper does that we don't
 1. **ELD Ensemble** (biggest factor) — multiple specialized models per landmark subset (e.g., one for ears, one for eyes, one for mouth). This is how they get from ~8.5 (single model) to 6.52.
@@ -225,25 +277,31 @@ The model can fit training data to NME ~6 but generalizes to only ~10.5. The 3,8
 | Flip-TTA | -0.5 to -1.0 | Easy | **Done** | -0.44 to -0.58 gain |
 | Higher res heatmaps (112x112) | -0.3 to -0.5 | Easy | **Done** | -0.14 (10.72->10.58) |
 | Heatmap supervision (hybrid loss) | -0.8 to -1.5 | Medium | **Failed** | NME 32.81 -- doesn't converge |
+| Tight crop margin | -1.0 | Easy | **Done** | -1.05 (10.58->9.53) / -1.03 with TTA |
+| Mixup augmentation | -0.5 to -1.5 | Medium | **Tried** | Underfitting — val NME ~10.4, worse than baseline |
+| Pure heatmap supervision (coord-free) | -0.5 to -1.0 | Medium | Not done | Queued, different from failed dual-loss |
+| SoftArgmax2D temperature tuning | -0.1 to -0.3 | Easy | Not done | beta parameter added, needs sweep |
 | Scale TTA (multi-scale inference) | -0.2 to -0.4 | Easy | Not done | -- |
-| Aggressive augmentation (mixup/cutout) | -0.5 to -1.5 | Medium | Not done | -- |
 | Multi-scale feature fusion (FPN-lite) | -0.4 to -1.0 | Medium | Not done | -- |
 | Stronger regularization (dropout/decay) | -0.3 to -0.5 | Easy | Not done | -- |
 | ELD-style ensemble (2-3 specialist models) | -2.0 to -4.0 | Hard | Not done | -- |
 
 ### Recommended next steps (in priority order)
 
-1. **Mixup / CutMix augmentation** (Easy, high potential) — directly attacks the overfitting gap. Mix pairs of training images and their landmark coordinates. This is the lowest-hanging fruit since overfitting is the primary bottleneck.
+1. **Pure heatmap supervision** (Medium, high potential) — train directly on Gaussian heatmap targets (sigma=2.5 for 112x112), no coordinate loss during training. This is how DeepLabCut achieves 6.70 on this dataset. Different from the earlier failed dual-loss approach: here there's NO coordinate branch at all during training, so no gradient interference. SoftArgmax2D is attached only for inference. Preset `pure_heatmap` is ready to go. Also try different beta values for SoftArgmax2D at inference (sweep [1, 10, 20, 40, 60]).
 
-2. **Scale TTA** (Easy, free gain) — run inference at 3 scales (e.g., 0.9x, 1.0x, 1.1x), average predictions. Stacks with existing flip-TTA for ~6 forward passes total. Expected additional gain: 0.2-0.4.
+2. **SoftArgmax2D temperature sweep** (Easy, free gain) — the current model uses beta=1.0 (flat softmax). Higher beta (20-60) makes the distribution peakier, potentially improving coordinate extraction precision. Can test on the existing trained model without retraining. Script `eval_experiments.py` has this implemented.
 
-3. **Stronger dropout** (Easy, quick test) — increase heatmap_dropout from 0.1 to 0.2 or 0.3. Quick experiment, 1-2 training runs.
+3. **Multi-scale TTA** (Easy, free gain) — run inference at 3 scales (0.9x, 1.0x, 1.1x) × 2 flips = 6 forward passes, average coordinates. Expected additional gain: 0.1-0.3 on top of flip-TTA.
 
-4. **ELD-style ensemble** (Hard, biggest gain) — this is what bridges the gap from ~10 to ~6.5 in the paper. Train 2-3 specialist models on landmark subsets (ears, eyes+nose, mouth). Each model sees all landmarks but is optimized for its subset. Average specialist predictions. Expected gain: 2-4 points.
+4. **Lighter mixup** (Easy, quick test) — try lower mixup probability (p=0.1-0.15) or only during Phase 1 (not Phase 2). The full p=0.4 was too aggressive.
+
+5. **ELD-style ensemble** (Hard, biggest gain) — train 2-3 specialist models on landmark subsets (ears, eyes+nose, mouth). This is what bridges the gap from ~9 to ~6.5 in the paper.
 
 ### Realistic targets (updated)
-- Single model + flip-TTA: **10.14** (achieved)
-- Single model + better regularization + multi-scale TTA: **~9.0-9.5**
+- Single model + flip-TTA: **9.11** (achieved)
+- Single model + pure heatmap supervision + TTA: **~8.5-9.0** (estimated)
+- Single model + all optimizations + multi-scale TTA: **~8.0-8.5**
 - ELD ensemble (2-3 specialists) + TTA: **~7.0-8.0**
 - Full ELD ensemble (5+ specialists) + aggressive TTA: **~6.5-7.0**
 
@@ -310,12 +368,12 @@ class SoftArgmax2D(tf.keras.layers.Layer):
 
 ## Training Configuration Reference
 
-### Current best preset (`heatmap_v2s_112`)
+### Current best preset (`tight_margin`)
 ```python
 backbone = "efficientnetv2s"
 head_type = "heatmap"
 heatmap_dropout = 0.1
-num_deconv_layers = 4          # 4 deconv -> 112x112 heatmaps (vs 3 -> 56x56)
+num_deconv_layers = 4          # 4 deconv -> 112x112 heatmaps
 epochs = 100                   # Phase 1: frozen backbone
 finetune_epochs = 200          # Phase 2: fine-tune last 50 layers
 finetune_learning_rate = 1e-5
@@ -325,12 +383,17 @@ learning_rate = 1e-4
 optimizer = "adamw"
 weight_decay = 1e-4
 loss = "mse"
+lm_margin = 0.05              # [KEY CHANGE] was 0.12 — tighter landmark bbox
+crop_margin = 0.10             # [KEY CHANGE] was 0.20 — tighter crop padding
 # Augmentations: rotation, flip, crop_jitter (0.08), scale (0.85-1.15),
 #                brightness, contrast, saturation, color_balance, sharpness, blur, noise
 ```
 
-### Previous best preset (`heatmap_v2s_best`)
-Same as above but with `num_deconv_layers = 3` (56x56 heatmaps).
+### Previous best preset (`heatmap_v2s_112`)
+Same as above but with `lm_margin=0.12` and `crop_margin=0.20` (more background padding).
+
+### Older preset (`heatmap_v2s_best`)
+Same architecture but with `num_deconv_layers = 3` (56x56 heatmaps) and wider margins.
 
 ### Training stability notes
 - lr=1e-3 ALWAYS diverges (even frozen backbone)
@@ -369,12 +432,16 @@ python scripts/train_dog_face_landmarks.py \
 | `scripts/gen_landmark_examples.py` | Generate _pred/_true visualizations for all 480 test images |
 | `scripts/infer_dog_landmarks_tflite.py` | TFLite inference pipeline (two-stage: bbox detection + landmarks) |
 | `scripts/run_nme_push.py` | Automated experiment runner with TTA evaluation |
+| `scripts/run_nme_push_v2.py` | NME push v2 experiment runner (tight margin, mixup, pure heatmap, combined) |
+| `scripts/eval_experiments.py` | Zero-cost evaluation (SoftArgmax temperature sweep, multi-scale TTA) |
 | `scripts/run_experiments.py` | Earlier experiment runner for ablation studies |
 | `CODEX_ADVISOR_REPORT.md` | Detailed analysis from OpenAI Codex consultation on strategies |
-| `artifacts/heatmap_v2s_112/` | **Current best model** (NME_IOD 10.58 / 10.14 with TTA) |
+| `artifacts/tight_margin/` | **Current best model** (NME_IOD 9.53 / 9.11 with TTA) |
+| `artifacts/heatmap_v2s_112/` | Previous best model (NME_IOD 10.58 / 10.14 with TTA) |
 | `artifacts/heatmap_v2s_best/` | Previous best model (NME_IOD 10.72) |
 | `artifacts/dog_face_landmarks/` | Production TFLite model + inference example images |
 | `artifacts/nme_push_results.md` | Raw experiment logs from overnight NME push run |
+| `artifacts/nme_push_v2_results.md` | Raw experiment logs from NME push v2 run |
 
 ---
 

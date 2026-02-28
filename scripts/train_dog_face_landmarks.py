@@ -105,11 +105,26 @@ class ExperimentConfig:
     aug_scale: bool = False
     aug_scale_range: tuple = (0.85, 1.15)
 
+    # Mixup augmentation
+    aug_mixup: bool = False
+    aug_mixup_alpha: float = 0.2      # Beta distribution parameter
+    aug_mixup_prob: float = 0.4       # probability of applying mixup
+
+    # Random erasing augmentation
+    aug_random_erase: bool = False
+    aug_random_erase_prob: float = 0.25
+    aug_random_erase_area_low: float = 0.02
+    aug_random_erase_area_high: float = 0.12
+
     # Heatmap supervision (hybrid loss with Gaussian targets)
     heatmap_supervision: bool = False
+    pure_heatmap_supervision: bool = False  # True = heatmap MSE only, no coord loss
     heatmap_sigma: float = 1.75       # Gaussian sigma in heatmap pixels
     coord_loss_weight: float = 0.25   # weight for coord MSE in hybrid mode
     num_deconv_layers: int = 3        # 3 -> 56x56, 4 -> 112x112
+
+    # SoftArgmax2D temperature
+    softargmax_beta: float = 1.0      # temperature parameter (higher = sharper)
 
     # Data
     img_size: int = 224
@@ -528,6 +543,168 @@ EXPERIMENT_PRESETS: dict[str, ExperimentConfig] = {
         nme_mode="iod",
         patience=50,
     ),
+    # --- Tight margin experiments ---
+    "tight_margin": ExperimentConfig(
+        name="tight_margin",
+        backbone="efficientnetv2s",
+        head_type="heatmap",
+        heatmap_dropout=0.1,
+        num_deconv_layers=4,
+        epochs=100,
+        finetune_epochs=200,
+        finetune_learning_rate=1e-5,
+        finetune_last_layers=50,
+        batch_size=16,
+        learning_rate=1e-4,
+        lr_schedule="constant",
+        loss="mse",
+        optimizer="adamw",
+        weight_decay=1e-4,
+        use_swa=False,
+        lm_margin=0.05,
+        crop_margin=0.10,
+        aug_rotation=True,
+        aug_flip=True,
+        aug_crop_jitter=True,
+        aug_crop_jitter_frac=0.08,
+        aug_scale=True,
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        nme_mode="iod",
+        patience=50,
+    ),
+    # --- Tight margin + mixup + random erasing ---
+    "tight_margin_mixup": ExperimentConfig(
+        name="tight_margin_mixup",
+        backbone="efficientnetv2s",
+        head_type="heatmap",
+        heatmap_dropout=0.1,
+        num_deconv_layers=4,
+        epochs=100,
+        finetune_epochs=200,
+        finetune_learning_rate=1e-5,
+        finetune_last_layers=50,
+        batch_size=16,
+        learning_rate=1e-4,
+        lr_schedule="constant",
+        loss="mse",
+        optimizer="adamw",
+        weight_decay=1e-4,
+        use_swa=False,
+        lm_margin=0.05,
+        crop_margin=0.10,
+        aug_rotation=True,
+        aug_flip=True,
+        aug_crop_jitter=True,
+        aug_crop_jitter_frac=0.08,
+        aug_scale=True,
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        aug_mixup=True,
+        aug_mixup_alpha=0.2,
+        aug_mixup_prob=0.4,
+        aug_random_erase=True,
+        aug_random_erase_prob=0.25,
+        nme_mode="iod",
+        patience=50,
+    ),
+    # --- Pure heatmap supervision (like DeepLabCut) ---
+    "pure_heatmap": ExperimentConfig(
+        name="pure_heatmap",
+        backbone="efficientnetv2s",
+        head_type="heatmap",
+        heatmap_dropout=0.1,
+        num_deconv_layers=4,
+        epochs=100,
+        finetune_epochs=200,
+        finetune_learning_rate=1e-5,
+        finetune_last_layers=50,
+        batch_size=16,
+        learning_rate=1e-4,
+        lr_schedule="constant",
+        loss="mse",
+        optimizer="adamw",
+        weight_decay=1e-4,
+        use_swa=False,
+        lm_margin=0.05,
+        crop_margin=0.10,
+        pure_heatmap_supervision=True,
+        heatmap_sigma=2.5,
+        aug_rotation=True,
+        aug_flip=True,
+        aug_crop_jitter=True,
+        aug_crop_jitter_frac=0.08,
+        aug_scale=True,
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        aug_mixup=True,
+        aug_mixup_alpha=0.2,
+        aug_mixup_prob=0.4,
+        aug_random_erase=True,
+        aug_random_erase_prob=0.25,
+        nme_mode="iod",
+        patience=50,
+    ),
+    # --- Combined best: pure heatmap + tight margin + mixup + higher beta ---
+    "combined_best": ExperimentConfig(
+        name="combined_best",
+        backbone="efficientnetv2s",
+        head_type="heatmap",
+        heatmap_dropout=0.1,
+        num_deconv_layers=4,
+        epochs=100,
+        finetune_epochs=200,
+        finetune_learning_rate=1e-5,
+        finetune_last_layers=50,
+        batch_size=16,
+        learning_rate=1e-4,
+        lr_schedule="constant",
+        loss="mse",
+        optimizer="adamw",
+        weight_decay=1e-4,
+        use_swa=False,
+        lm_margin=0.05,
+        crop_margin=0.10,
+        pure_heatmap_supervision=True,
+        heatmap_sigma=2.5,
+        softargmax_beta=40.0,
+        aug_rotation=True,
+        aug_rotation_deg=20.0,
+        aug_flip=True,
+        aug_crop_jitter=True,
+        aug_crop_jitter_frac=0.10,
+        aug_scale=True,
+        aug_scale_range=(0.80, 1.20),
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        aug_mixup=True,
+        aug_mixup_alpha=0.2,
+        aug_mixup_prob=0.4,
+        aug_random_erase=True,
+        aug_random_erase_prob=0.25,
+        nme_mode="iod",
+        patience=50,
+    ),
 }
 
 
@@ -759,6 +936,44 @@ def load_split_records(data_root: Path, split: str, lm_margin: float) -> list[Re
 # TF dataset pipeline
 # ---------------------------------------------------------------------------
 
+def _mixup_batch(images, targets, alpha=0.2, prob=0.4, is_heatmap=False):
+    """Apply mixup to a batch of images and targets.
+
+    For coordinate targets: linear interpolation.
+    For heatmap targets: linear interpolation of Gaussian heatmaps.
+    For dict targets (heatmap supervision): interpolate both.
+    """
+    batch_size = tf.shape(images)[0]
+    do_mixup = tf.random.uniform(()) < prob
+
+    # Sample mixup coefficient from Beta(alpha, alpha)
+    # Use uniform approximation for simplicity in tf.data
+    lam = tf.random.uniform((), 0.0, 1.0)
+    # Clamp to keep lambda > 0.5 (keep original image dominant)
+    lam = tf.maximum(lam, 1.0 - lam) if alpha < 0.5 else lam
+
+    # Shuffle indices for mixing pairs
+    indices = tf.random.shuffle(tf.range(batch_size))
+    images_shuffled = tf.gather(images, indices)
+
+    mixed_images = lam * images + (1.0 - lam) * images_shuffled
+
+    if isinstance(targets, dict):
+        targets_shuffled = {k: tf.gather(v, indices) for k, v in targets.items()}
+        mixed_targets = {k: lam * v + (1.0 - lam) * targets_shuffled[k] for k, v in targets.items()}
+    else:
+        targets_shuffled = tf.gather(targets, indices)
+        mixed_targets = lam * targets + (1.0 - lam) * targets_shuffled
+
+    mixed_images = tf.where(do_mixup, mixed_images, images)
+    if isinstance(targets, dict):
+        mixed_targets = {k: tf.where(do_mixup, mixed_targets[k], targets[k]) for k in targets}
+    else:
+        mixed_targets = tf.where(do_mixup, mixed_targets, targets)
+
+    return mixed_images, mixed_targets
+
+
 def build_tf_dataset(
     records: list[Record],
     cfg: ExperimentConfig,
@@ -799,13 +1014,31 @@ def build_tf_dataset(
             if cfg.aug_flip:
                 crop, lm_norm = flip_augment(crop, lm_norm)
             crop = photometric_augment(crop, cfg)
-        if cfg.heatmap_supervision:
+            if cfg.aug_random_erase:
+                crop = augment_random_erase(
+                    crop, prob=cfg.aug_random_erase_prob,
+                    area_low=cfg.aug_random_erase_area_low,
+                    area_high=cfg.aug_random_erase_area_high,
+                )
+        if cfg.heatmap_supervision or cfg.pure_heatmap_supervision:
             hm_targets = generate_gaussian_heatmaps(lm_norm, hm_size, cfg.heatmap_sigma)
+            if cfg.pure_heatmap_supervision:
+                return crop, hm_targets
             return crop, {"hm": hm_targets, "xy": lm_norm}
         return crop, lm_norm
 
     ds = ds.map(_load_and_crop, num_parallel_calls=tf.data.AUTOTUNE)
-    ds = ds.batch(cfg.batch_size)
+
+    # Mixup augmentation (operates on batches)
+    if training and cfg.aug_mixup:
+        ds = ds.batch(cfg.batch_size)
+        ds = ds.map(
+            lambda x, y: _mixup_batch(x, y, cfg.aug_mixup_alpha, cfg.aug_mixup_prob,
+                                       cfg.pure_heatmap_supervision or cfg.heatmap_supervision),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
+    else:
+        ds = ds.batch(cfg.batch_size)
     ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds
 
@@ -1019,6 +1252,39 @@ def photometric_augment(image: tf.Tensor, cfg: ExperimentConfig) -> tf.Tensor:
     return tf.clip_by_value(image, 0.0, 1.0)
 
 
+def augment_random_erase(
+    image: tf.Tensor, prob: float = 0.25,
+    area_low: float = 0.02, area_high: float = 0.12,
+) -> tf.Tensor:
+    """Random erasing augmentation (Zhong et al. 2020).
+
+    Randomly erases a rectangular region with random pixel values.
+    """
+    do_erase = tf.random.uniform(()) < prob
+    h = tf.shape(image)[0]
+    w = tf.shape(image)[1]
+    area = tf.cast(h * w, tf.float32)
+
+    erase_area = tf.random.uniform((), area_low, area_high) * area
+    aspect = tf.random.uniform((), 0.3, 1.0 / 0.3)
+    eh = tf.cast(tf.math.sqrt(erase_area * aspect), tf.int32)
+    ew = tf.cast(tf.math.sqrt(erase_area / aspect), tf.int32)
+    eh = tf.minimum(eh, h)
+    ew = tf.minimum(ew, w)
+
+    ey = tf.random.uniform((), 0, h - eh + 1, dtype=tf.int32)
+    ex = tf.random.uniform((), 0, w - ew + 1, dtype=tf.int32)
+
+    noise = tf.random.uniform([eh, ew, 3], 0.0, 1.0)
+    # Create mask
+    padding = [[ey, h - ey - eh], [ex, w - ex - ew], [0, 0]]
+    mask = tf.pad(tf.ones([eh, ew, 3]), padding)
+    noise_padded = tf.pad(noise, padding)
+
+    erased = tf.where(tf.cast(mask, tf.bool), noise_padded, image)
+    return tf.where(do_erase, erased, image)
+
+
 def generate_gaussian_heatmaps(
     lm_norm_flat: tf.Tensor, hm_size: int, sigma: float,
 ) -> tf.Tensor:
@@ -1152,11 +1418,17 @@ class SoftArgmax2D(tf.keras.layers.Layer):
     Input:  (B, H, W, K) — K heatmaps of spatial size H×W
     Output: (B, K*2) — flattened [x0, y0, x1, y1, ...] in [0, 1]
 
+    Args:
+        beta: Temperature parameter for softmax. Higher values produce sharper
+              distributions. Default 1.0 (standard softmax). Use 20-60 for
+              112x112 heatmaps with direct heatmap supervision.
+
     All ops are TFLite-compatible (softmax, multiply, reduce_sum, constants).
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, beta=1.0, **kwargs):
         super().__init__(**kwargs)
+        self.beta = beta
 
     def build(self, input_shape):
         _, h, w, _ = input_shape
@@ -1176,9 +1448,9 @@ class SoftArgmax2D(tf.keras.layers.Layer):
         w = tf.shape(heatmaps)[2]
         k = tf.shape(heatmaps)[3]
 
-        # Spatial softmax: flatten H*W, softmax, reshape back.
+        # Spatial softmax with temperature: flatten H*W, softmax, reshape back.
         flat = tf.reshape(heatmaps, [b, h * w, k])        # (B, H*W, K)
-        weights = tf.nn.softmax(flat, axis=1)               # (B, H*W, K)
+        weights = tf.nn.softmax(flat * self.beta, axis=1)   # (B, H*W, K)
         weights = tf.reshape(weights, [b, h, w, k])         # (B, H, W, K)
 
         # Weighted sum of coordinates.
@@ -1190,11 +1462,14 @@ class SoftArgmax2D(tf.keras.layers.Layer):
         return tf.reshape(coords, [b, k * 2])  # (B, K*2)
 
     def get_config(self):
-        return super().get_config()
+        config = super().get_config()
+        config["beta"] = self.beta
+        return config
 
 
 def _build_deconv_head(backbone_output, num_landmarks: int, channels: int,
-                       dropout: float = 0.0, num_deconv: int = 3):
+                       dropout: float = 0.0, num_deconv: int = 3,
+                       softargmax_beta: float = 1.0):
     """SimpleBaseline-style deconv head: N× deconv + 1×1 conv + soft-argmax.
 
     backbone_output: (B, 7, 7, C) feature map from EfficientNet
@@ -1220,7 +1495,7 @@ def _build_deconv_head(backbone_output, num_landmarks: int, channels: int,
     )(x)
 
     # Differentiable coordinate extraction.
-    coords = SoftArgmax2D(name="soft_argmax")(heatmaps)
+    coords = SoftArgmax2D(beta=softargmax_beta, name="soft_argmax")(heatmaps)
     return heatmaps, coords
 
 
@@ -1255,9 +1530,17 @@ def build_model(cfg: ExperimentConfig) -> tf.keras.Model:
         heatmaps, coords = _build_deconv_head(
             x, NUM_LANDMARKS, cfg.heatmap_channels,
             dropout=cfg.heatmap_dropout, num_deconv=cfg.num_deconv_layers,
+            softargmax_beta=cfg.softargmax_beta,
         )
         coords = tf.keras.layers.Identity(name="landmarks_xy")(coords)
-        if cfg.heatmap_supervision:
+        if cfg.pure_heatmap_supervision:
+            # Pure heatmap supervision: output only heatmaps for training.
+            # SoftArgmax2D coords are still in the graph for TFLite export.
+            return tf.keras.Model(
+                inputs=inputs, outputs=heatmaps,
+                name="dog_face_landmark_regressor",
+            )
+        elif cfg.heatmap_supervision:
             # Multi-output for training: heatmaps + coordinates
             return tf.keras.Model(
                 inputs=inputs,
@@ -1308,7 +1591,14 @@ def compile_model(model: tf.keras.Model, lr, cfg: ExperimentConfig) -> None:
     else:
         coord_loss_fn = _make_wing_loss(cfg.wing_omega, cfg.wing_epsilon)
 
-    if cfg.heatmap_supervision:
+    if cfg.pure_heatmap_supervision:
+        # Pure heatmap supervision: only heatmap MSE loss, no coord metrics during training.
+        model.compile(
+            optimizer=optimizer,
+            loss=tf.keras.losses.MeanSquaredError(),
+            run_eagerly=False,
+        )
+    elif cfg.heatmap_supervision:
         model.compile(
             optimizer=optimizer,
             loss={"hm": tf.keras.losses.MeanSquaredError(), "xy": coord_loss_fn},
@@ -1376,6 +1666,8 @@ def build_lr_schedule(cfg: ExperimentConfig, num_train: int, total_epochs: int):
 
 
 def _monitor_metric(cfg: ExperimentConfig) -> str:
+    if cfg.pure_heatmap_supervision:
+        return "val_loss"
     base = "landmark_nme_iod" if cfg.nme_mode == "iod" else "landmark_nme"
     if cfg.heatmap_supervision:
         # Keras prefixes with the output layer name, not the dict key.
@@ -1384,6 +1676,8 @@ def _monitor_metric(cfg: ExperimentConfig) -> str:
 
 
 def _score_key(cfg: ExperimentConfig) -> str:
+    if cfg.pure_heatmap_supervision:
+        return "loss"
     base = "landmark_nme_iod" if cfg.nme_mode == "iod" else "landmark_nme"
     if cfg.heatmap_supervision:
         return f"landmarks_xy_{base}"
@@ -1696,8 +1990,8 @@ def main() -> None:
     compile_model(model, lr=cfg.learning_rate, cfg=cfg)
     val_metrics = evaluate_model(model, val_ds)
 
-    # For multi-output models, extract coord-only model for TFLite export.
-    if cfg.heatmap_supervision:
+    # For heatmap models, extract coord-only model for TFLite export.
+    if cfg.pure_heatmap_supervision or cfg.heatmap_supervision:
         export_model = tf.keras.Model(
             inputs=model.inputs,
             outputs=model.get_layer("landmarks_xy").output,
