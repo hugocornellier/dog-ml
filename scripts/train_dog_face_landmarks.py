@@ -105,6 +105,12 @@ class ExperimentConfig:
     aug_scale: bool = False
     aug_scale_range: tuple = (0.85, 1.15)
 
+    # Heatmap supervision (hybrid loss with Gaussian targets)
+    heatmap_supervision: bool = False
+    heatmap_sigma: float = 1.75       # Gaussian sigma in heatmap pixels
+    coord_loss_weight: float = 0.25   # weight for coord MSE in hybrid mode
+    num_deconv_layers: int = 3        # 3 -> 56x56, 4 -> 112x112
+
     # Data
     img_size: int = 224
     crop_margin: float = 0.20
@@ -348,6 +354,180 @@ EXPERIMENT_PRESETS: dict[str, ExperimentConfig] = {
         nme_mode="iod",
         patience=50,
     ),
+    # --- Heatmap supervision experiments (Gaussian target hybrid loss) ---
+    # coord_loss_weight is HIGH (1.0) because coord accuracy is primary.
+    # hm loss acts as spatial regularizer, weighted down.
+    "heatmap_v2s_hmsup_s175": ExperimentConfig(
+        name="heatmap_v2s_hmsup_s175",
+        backbone="efficientnetv2s",
+        head_type="heatmap",
+        heatmap_dropout=0.1,
+        heatmap_supervision=True,
+        heatmap_sigma=1.75,
+        coord_loss_weight=1.0,
+        epochs=100,
+        finetune_epochs=200,
+        finetune_learning_rate=1e-5,
+        finetune_last_layers=50,
+        batch_size=16,
+        learning_rate=1e-4,
+        lr_schedule="constant",
+        loss="mse",
+        optimizer="adamw",
+        weight_decay=1e-4,
+        use_swa=False,
+        aug_rotation=True,
+        aug_flip=True,
+        aug_crop_jitter=True,
+        aug_crop_jitter_frac=0.08,
+        aug_scale=True,
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        nme_mode="iod",
+        patience=50,
+    ),
+    "heatmap_v2s_hmsup_s150": ExperimentConfig(
+        name="heatmap_v2s_hmsup_s150",
+        backbone="efficientnetv2s",
+        head_type="heatmap",
+        heatmap_dropout=0.1,
+        heatmap_supervision=True,
+        heatmap_sigma=1.5,
+        coord_loss_weight=1.0,
+        epochs=100,
+        finetune_epochs=200,
+        finetune_learning_rate=1e-5,
+        finetune_last_layers=50,
+        batch_size=16,
+        learning_rate=1e-4,
+        lr_schedule="constant",
+        loss="mse",
+        optimizer="adamw",
+        weight_decay=1e-4,
+        use_swa=False,
+        aug_rotation=True,
+        aug_flip=True,
+        aug_crop_jitter=True,
+        aug_crop_jitter_frac=0.08,
+        aug_scale=True,
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        nme_mode="iod",
+        patience=50,
+    ),
+    "heatmap_v2s_hmsup_s200": ExperimentConfig(
+        name="heatmap_v2s_hmsup_s200",
+        backbone="efficientnetv2s",
+        head_type="heatmap",
+        heatmap_dropout=0.1,
+        heatmap_supervision=True,
+        heatmap_sigma=2.0,
+        coord_loss_weight=1.0,
+        epochs=100,
+        finetune_epochs=200,
+        finetune_learning_rate=1e-5,
+        finetune_last_layers=50,
+        batch_size=16,
+        learning_rate=1e-4,
+        lr_schedule="constant",
+        loss="mse",
+        optimizer="adamw",
+        weight_decay=1e-4,
+        use_swa=False,
+        aug_rotation=True,
+        aug_flip=True,
+        aug_crop_jitter=True,
+        aug_crop_jitter_frac=0.08,
+        aug_scale=True,
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        nme_mode="iod",
+        patience=50,
+    ),
+    # --- 112x112 heatmap resolution ---
+    "heatmap_v2s_112": ExperimentConfig(
+        name="heatmap_v2s_112",
+        backbone="efficientnetv2s",
+        head_type="heatmap",
+        heatmap_dropout=0.1,
+        num_deconv_layers=4,
+        epochs=100,
+        finetune_epochs=200,
+        finetune_learning_rate=1e-5,
+        finetune_last_layers=50,
+        batch_size=16,
+        learning_rate=1e-4,
+        lr_schedule="constant",
+        loss="mse",
+        optimizer="adamw",
+        weight_decay=1e-4,
+        use_swa=False,
+        aug_rotation=True,
+        aug_flip=True,
+        aug_crop_jitter=True,
+        aug_crop_jitter_frac=0.08,
+        aug_scale=True,
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        nme_mode="iod",
+        patience=50,
+    ),
+    # --- 112x112 + heatmap supervision combined ---
+    "heatmap_v2s_112_hmsup": ExperimentConfig(
+        name="heatmap_v2s_112_hmsup",
+        backbone="efficientnetv2s",
+        head_type="heatmap",
+        heatmap_dropout=0.1,
+        heatmap_supervision=True,
+        heatmap_sigma=1.75,
+        coord_loss_weight=1.0,
+        num_deconv_layers=4,
+        epochs=100,
+        finetune_epochs=200,
+        finetune_learning_rate=1e-5,
+        finetune_last_layers=50,
+        batch_size=16,
+        learning_rate=1e-4,
+        lr_schedule="constant",
+        loss="mse",
+        optimizer="adamw",
+        weight_decay=1e-4,
+        use_swa=False,
+        aug_rotation=True,
+        aug_flip=True,
+        aug_crop_jitter=True,
+        aug_crop_jitter_frac=0.08,
+        aug_scale=True,
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        nme_mode="iod",
+        patience=50,
+    ),
 }
 
 
@@ -417,6 +597,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--aug-scale", action="store_true", default=None)
     p.add_argument("--no-aug-scale", dest="aug_scale", action="store_false")
     p.add_argument("--optimizer", choices=["adam", "adamw"], default=None)
+    p.add_argument("--heatmap-supervision", action="store_true", default=None)
+    p.add_argument("--no-heatmap-supervision", dest="heatmap_supervision", action="store_false")
+    p.add_argument("--heatmap-sigma", type=float, default=None)
+    p.add_argument("--coord-loss-weight", type=float, default=None)
+    p.add_argument("--num-deconv-layers", type=int, default=None)
     return p.parse_args()
 
 
@@ -460,6 +645,10 @@ def resolve_config(args: argparse.Namespace) -> ExperimentConfig:
         "aug_flip": args.aug_flip,
         "aug_scale": args.aug_scale,
         "optimizer": args.optimizer,
+        "heatmap_supervision": args.heatmap_supervision,
+        "heatmap_sigma": args.heatmap_sigma,
+        "coord_loss_weight": args.coord_loss_weight,
+        "num_deconv_layers": args.num_deconv_layers,
     }
     for key, val in _override.items():
         if val is not None:
@@ -588,12 +777,13 @@ def build_tf_dataset(
 
     img_size = cfg.img_size
     crop_margin = cfg.crop_margin
+    hm_size = (img_size // 32) * (2 ** cfg.num_deconv_layers)  # 56 or 112
 
     def _load_and_crop(
         path: tf.Tensor,
         box_abs: tf.Tensor,
         lm_flat: tf.Tensor,
-    ) -> tuple[tf.Tensor, tf.Tensor]:
+    ):
         img_bytes = tf.io.read_file(path)
         image = tf.io.decode_png(img_bytes, channels=3)
         image = tf.image.convert_image_dtype(image, tf.float32)
@@ -609,6 +799,9 @@ def build_tf_dataset(
             if cfg.aug_flip:
                 crop, lm_norm = flip_augment(crop, lm_norm)
             crop = photometric_augment(crop, cfg)
+        if cfg.heatmap_supervision:
+            hm_targets = generate_gaussian_heatmaps(lm_norm, hm_size, cfg.heatmap_sigma)
+            return crop, {"hm": hm_targets, "xy": lm_norm}
         return crop, lm_norm
 
     ds = ds.map(_load_and_crop, num_parallel_calls=tf.data.AUTOTUNE)
@@ -826,6 +1019,38 @@ def photometric_augment(image: tf.Tensor, cfg: ExperimentConfig) -> tf.Tensor:
     return tf.clip_by_value(image, 0.0, 1.0)
 
 
+def generate_gaussian_heatmaps(
+    lm_norm_flat: tf.Tensor, hm_size: int, sigma: float,
+) -> tf.Tensor:
+    """Generate 2D Gaussian heatmaps for each landmark.
+
+    Args:
+        lm_norm_flat: [92] tensor of normalized coords [x0,y0,x1,y1,...]
+        hm_size: heatmap resolution (e.g. 56 or 112)
+        sigma: Gaussian sigma in heatmap pixels
+
+    Returns:
+        [hm_size, hm_size, 46] tensor of Gaussian heatmaps
+    """
+    lm = tf.reshape(lm_norm_flat, [NUM_LANDMARKS, 2])  # [46, 2]
+    size_f = tf.cast(hm_size - 1, tf.float32)
+    mu_x = lm[:, 0] * size_f  # [46]
+    mu_y = lm[:, 1] * size_f  # [46]
+
+    grid = tf.cast(tf.range(hm_size), tf.float32)  # [hm_size]
+    grid_x = tf.reshape(grid, [1, 1, hm_size])  # [1, 1, W]
+    grid_y = tf.reshape(grid, [1, hm_size, 1])  # [1, H, 1]
+
+    mu_x = tf.reshape(mu_x, [NUM_LANDMARKS, 1, 1])  # [46, 1, 1]
+    mu_y = tf.reshape(mu_y, [NUM_LANDMARKS, 1, 1])  # [46, 1, 1]
+
+    dx2 = tf.square(grid_x - mu_x)  # [46, 1, W]
+    dy2 = tf.square(grid_y - mu_y)  # [46, H, 1]
+    heatmaps = tf.exp(-(dx2 + dy2) / (2.0 * sigma * sigma))  # [46, H, W]
+
+    return tf.transpose(heatmaps, [1, 2, 0])  # [H, W, 46]
+
+
 # ---------------------------------------------------------------------------
 # Loss and metrics
 # ---------------------------------------------------------------------------
@@ -969,16 +1194,16 @@ class SoftArgmax2D(tf.keras.layers.Layer):
 
 
 def _build_deconv_head(backbone_output, num_landmarks: int, channels: int,
-                       dropout: float = 0.0):
-    """SimpleBaseline-style deconv head: 3× deconv + 1×1 conv + soft-argmax.
+                       dropout: float = 0.0, num_deconv: int = 3):
+    """SimpleBaseline-style deconv head: N× deconv + 1×1 conv + soft-argmax.
 
     backbone_output: (B, 7, 7, C) feature map from EfficientNet
-    Returns: (B, num_landmarks*2) coordinates in [0, 1]
+    num_deconv: 3 for 56×56 heatmaps, 4 for 112×112
+    Returns: (heatmaps_tensor, coords_tensor)
     """
     x = backbone_output
 
-    # 3 deconv blocks: 7→14→28→56
-    for i in range(3):
+    for i in range(num_deconv):
         x = tf.keras.layers.Conv2DTranspose(
             channels, kernel_size=4, strides=2, padding="same",
             use_bias=False, name=f"deconv_{i+1}",
@@ -992,11 +1217,11 @@ def _build_deconv_head(backbone_output, num_landmarks: int, channels: int,
     heatmaps = tf.keras.layers.Conv2D(
         num_landmarks, kernel_size=1, padding="same",
         name="heatmap_conv",
-    )(x)  # (B, 56, 56, num_landmarks)
+    )(x)
 
     # Differentiable coordinate extraction.
-    coords = SoftArgmax2D(name="soft_argmax")(heatmaps)  # (B, num_landmarks*2)
-    return coords
+    coords = SoftArgmax2D(name="soft_argmax")(heatmaps)
+    return heatmaps, coords
 
 
 # ---------------------------------------------------------------------------
@@ -1027,10 +1252,23 @@ def build_model(cfg: ExperimentConfig) -> tf.keras.Model:
 
     if cfg.head_type == "heatmap":
         # Deconv upsampling + heatmap + soft-argmax (preserves spatial info).
-        outputs = _build_deconv_head(x, NUM_LANDMARKS, cfg.heatmap_channels,
-                                     dropout=cfg.heatmap_dropout)
-        # Rename for consistency with dense head output.
-        outputs = tf.keras.layers.Identity(name="landmarks_xy")(outputs)
+        heatmaps, coords = _build_deconv_head(
+            x, NUM_LANDMARKS, cfg.heatmap_channels,
+            dropout=cfg.heatmap_dropout, num_deconv=cfg.num_deconv_layers,
+        )
+        coords = tf.keras.layers.Identity(name="landmarks_xy")(coords)
+        if cfg.heatmap_supervision:
+            # Multi-output for training: heatmaps + coordinates
+            return tf.keras.Model(
+                inputs=inputs,
+                outputs={"hm": heatmaps, "xy": coords},
+                name="dog_face_landmark_regressor",
+            )
+        else:
+            return tf.keras.Model(
+                inputs=inputs, outputs=coords,
+                name="dog_face_landmark_regressor",
+            )
     else:
         # Original dense head (GAP destroys spatial info).
         x = tf.keras.layers.GlobalAveragePooling2D()(x)
@@ -1066,16 +1304,25 @@ def compile_model(model: tf.keras.Model, lr, cfg: ExperimentConfig) -> None:
             optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
 
     if cfg.loss == "mse":
-        loss_fn = tf.keras.losses.MeanSquaredError()
+        coord_loss_fn = tf.keras.losses.MeanSquaredError()
     else:
-        loss_fn = _make_wing_loss(cfg.wing_omega, cfg.wing_epsilon)
+        coord_loss_fn = _make_wing_loss(cfg.wing_omega, cfg.wing_epsilon)
 
-    model.compile(
-        optimizer=optimizer,
-        loss=loss_fn,
-        metrics=[landmark_nme, landmark_nme_iod],
-        run_eagerly=False,
-    )
+    if cfg.heatmap_supervision:
+        model.compile(
+            optimizer=optimizer,
+            loss={"hm": tf.keras.losses.MeanSquaredError(), "xy": coord_loss_fn},
+            loss_weights={"hm": 0.1, "xy": cfg.coord_loss_weight},
+            metrics={"xy": [landmark_nme, landmark_nme_iod]},
+            run_eagerly=False,
+        )
+    else:
+        model.compile(
+            optimizer=optimizer,
+            loss=coord_loss_fn,
+            metrics=[landmark_nme, landmark_nme_iod],
+            run_eagerly=False,
+        )
 
 
 def get_backbone(model: tf.keras.Model) -> tf.keras.Model:
@@ -1085,6 +1332,7 @@ def get_backbone(model: tf.keras.Model) -> tf.keras.Model:
     raise RuntimeError("EfficientNet backbone not found")
 
 
+@tf.keras.utils.register_keras_serializable(package="DogFLW")
 class WarmupSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
     """Linear warmup then delegates to an inner schedule (or constant)."""
 
@@ -1128,11 +1376,18 @@ def build_lr_schedule(cfg: ExperimentConfig, num_train: int, total_epochs: int):
 
 
 def _monitor_metric(cfg: ExperimentConfig) -> str:
-    return "val_landmark_nme_iod" if cfg.nme_mode == "iod" else "val_landmark_nme"
+    base = "landmark_nme_iod" if cfg.nme_mode == "iod" else "landmark_nme"
+    if cfg.heatmap_supervision:
+        # Keras prefixes with the output layer name, not the dict key.
+        return f"val_landmarks_xy_{base}"
+    return f"val_{base}"
 
 
 def _score_key(cfg: ExperimentConfig) -> str:
-    return "landmark_nme_iod" if cfg.nme_mode == "iod" else "landmark_nme"
+    base = "landmark_nme_iod" if cfg.nme_mode == "iod" else "landmark_nme"
+    if cfg.heatmap_supervision:
+        return f"landmarks_xy_{base}"
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -1441,8 +1696,17 @@ def main() -> None:
     compile_model(model, lr=cfg.learning_rate, cfg=cfg)
     val_metrics = evaluate_model(model, val_ds)
 
+    # For multi-output models, extract coord-only model for TFLite export.
+    if cfg.heatmap_supervision:
+        export_model = tf.keras.Model(
+            inputs=model.inputs,
+            outputs=model.get_layer("landmarks_xy").output,
+        )
+    else:
+        export_model = model
+
     tflite_path = args.out_dir / f"dog_face_landmarks_{cfg.img_size}_float16.tflite"
-    export_tflite(model, tflite_path)
+    export_tflite(export_model, tflite_path)
 
     tflite_sanity = tflite_sanity_check(
         tflite_path, val_records,
