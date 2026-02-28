@@ -48,15 +48,11 @@ LM_IMG_SIZE = 224
 LM_MARGIN = 0.12
 CROP_MARGIN = 0.20
 
-# Same images used in the existing examples.
-STEMS = [
-    "n02085620_1073", "n02086240_3921", "n02086646_45",
-    "n02088364_4281", "n02089867_2382", "n02092339_2752",
-    "n02097474_7545", "n02098286_4250", "n02099267_3900",
-    "n02099849_4287", "n02100583_3713", "n02102177_3917",
-    "n02102480_4743", "n02105505_2570", "n02110185_712",
-    "n02111500_7983", "n02112706_1995", "n02113712_459",
-]
+# Use all test images.
+STEMS = sorted(
+    p.stem for p in (DATA_ROOT / "test" / "images").glob("*.png")
+    if (DATA_ROOT / "test" / "labels" / f"{p.stem}.json").exists()
+)
 
 
 def make_true_image(image: Image.Image, label_path: Path) -> Image.Image:

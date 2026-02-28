@@ -16,11 +16,12 @@ stage-1 is used with the same margin.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
 import random
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +31,324 @@ import tensorflow as tf
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
 NUM_LANDMARKS = 46
+
+# Outer eye corner landmark indices for IOD normalization.
+# Landmark 18 = leftmost point of left eye (outer corner).
+# Landmark 19 = rightmost point of right eye (outer corner).
+LEFT_OUTER_EYE_IDX = 18
+RIGHT_OUTER_EYE_IDX = 19
+
+# Landmark index permutation for horizontal flip (DogFLW label convention).
+FLIP_INDEX = [
+    1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14,
+    17, 16, 19, 18, 21, 20, 23, 22, 24, 25, 27, 26, 29, 28,
+    31, 30, 32, 34, 33, 35, 37, 36, 38, 40, 39, 41, 42, 44,
+    43, 45,
+]
+
+
+# ---------------------------------------------------------------------------
+# Experiment configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ExperimentConfig:
+    """All tuneable experiment knobs in one place."""
+    name: str = "default"
+
+    # Architecture
+    backbone: str = "efficientnetb2"  # "efficientnetb2" or "efficientnetv2s"
+    head_type: str = "dense"          # "dense" (GAP+FC) or "heatmap" (deconv+soft-argmax)
+    heatmap_channels: int = 256       # intermediate channels in deconv head
+    heatmap_dropout: float = 0.0      # SpatialDropout2D rate in deconv head
+
+
+    # Training schedule
+    epochs: int = 300
+    finetune_epochs: int = 0        # 0 = single-phase training
+    batch_size: int = 16
+    learning_rate: float = 1e-3
+    finetune_learning_rate: float = 1e-4
+    finetune_last_layers: int = 120
+    lr_schedule: str = "constant"   # "constant" or "cosine"
+    lr_min: float = 1e-6
+
+    # Loss
+    loss: str = "mse"               # "mse" or "wing"
+    wing_omega: float = 0.1
+    wing_epsilon: float = 0.02
+
+    # Optimizer
+    optimizer: str = "adam"         # "adam" or "adamw"
+    weight_decay: float = 1e-4
+
+    # Regularisation
+    use_swa: bool = False
+    swa_start_frac: float = 0.5
+
+    # Augmentations
+    aug_rotation: bool = True
+    aug_rotation_deg: float = 15.0
+    aug_crop_jitter: bool = False
+    aug_crop_jitter_frac: float = 0.05
+    aug_brightness: bool = True
+    aug_brightness_delta: float = 0.10
+    aug_contrast: bool = True
+    aug_contrast_range: tuple = (0.80, 1.20)
+    aug_saturation: bool = True
+    aug_saturation_range: tuple = (0.80, 1.20)
+    aug_color_balance: bool = False
+    aug_sharpness: bool = False
+    aug_blur: bool = False
+    aug_noise: bool = False
+    aug_flip: bool = False
+    aug_scale: bool = False
+    aug_scale_range: tuple = (0.85, 1.15)
+
+    # Data
+    img_size: int = 224
+    crop_margin: float = 0.20
+    lm_margin: float = 0.12
+
+    # Metric used for early stopping / model selection
+    nme_mode: str = "iod"           # "crop" or "iod"
+
+    # Early stopping
+    patience: int = 50
+
+    unfreeze_backbone: bool = False  # True = full fine-tuning; False = head-only (paper default)
+
+    seed: int = 42
+    no_pretrained: bool = False
+
+
+EXPERIMENT_PRESETS: dict[str, ExperimentConfig] = {
+    "paper_baseline": ExperimentConfig(
+        name="paper_baseline",
+        backbone="efficientnetb2",
+        epochs=300,
+        finetune_epochs=0,
+        batch_size=16,
+        learning_rate=1e-4,
+        lr_schedule="constant",
+        loss="mse",
+        use_swa=False,
+        aug_rotation=True,
+        aug_crop_jitter=False,
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        nme_mode="iod",
+        patience=50,
+    ),
+    "paper_baseline_v2s": ExperimentConfig(
+        name="paper_baseline_v2s",
+        backbone="efficientnetv2s",
+        epochs=300,
+        finetune_epochs=0,
+        batch_size=16,
+        learning_rate=1e-4,
+        lr_schedule="constant",
+        loss="mse",
+        use_swa=False,
+        aug_rotation=True,
+        aug_crop_jitter=False,
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        nme_mode="iod",
+        patience=50,
+    ),
+    "best_v2s": ExperimentConfig(
+        name="best_v2s",
+        backbone="efficientnetv2s",
+        epochs=50,
+        finetune_epochs=250,
+        batch_size=16,
+        learning_rate=1e-4,
+        finetune_learning_rate=1e-6,
+        finetune_last_layers=30,         # unfreeze only final block of V2S (513 total)
+        lr_schedule="constant",
+        loss="mse",
+        use_swa=False,
+        aug_rotation=True,
+        aug_crop_jitter=False,
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        nme_mode="iod",
+        patience=50,
+    ),
+    "current": ExperimentConfig(
+        name="current",
+        backbone="efficientnetb2",
+        epochs=15,
+        finetune_epochs=60,
+        batch_size=32,
+        learning_rate=1e-3,
+        finetune_learning_rate=1e-4,
+        finetune_last_layers=120,
+        lr_schedule="cosine",
+        loss="wing",
+        use_swa=True,
+        swa_start_frac=0.5,
+        aug_rotation=True,
+        aug_crop_jitter=True,
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=False,
+        aug_sharpness=False,
+        aug_blur=False,
+        aug_noise=False,
+        nme_mode="iod",
+        patience=12,
+    ),
+    "heatmap_v2s": ExperimentConfig(
+        name="heatmap_v2s",
+        backbone="efficientnetv2s",
+        head_type="heatmap",
+        epochs=300,
+        finetune_epochs=0,
+        batch_size=16,
+        learning_rate=1e-4,
+        lr_schedule="constant",
+        loss="mse",
+        use_swa=False,
+        aug_rotation=True,
+        aug_crop_jitter=False,
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        nme_mode="iod",
+        patience=50,
+    ),
+    "heatmap_v2s_reg": ExperimentConfig(
+        name="heatmap_v2s_reg",
+        backbone="efficientnetv2s",
+        head_type="heatmap",
+        heatmap_dropout=0.15,
+        epochs=300,
+        finetune_epochs=0,
+        batch_size=16,
+        learning_rate=1e-4,
+        lr_schedule="constant",
+        loss="mse",
+        use_swa=False,
+        aug_rotation=True,
+        aug_crop_jitter=True,    # also enable crop jitter
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        nme_mode="iod",
+        patience=50,
+    ),
+    "heatmap_v2s_ft": ExperimentConfig(
+        name="heatmap_v2s_ft",
+        backbone="efficientnetv2s",
+        head_type="heatmap",
+        heatmap_dropout=0.15,
+        epochs=100,                  # Phase 1: train head
+        finetune_epochs=200,         # Phase 2: fine-tune backbone
+        finetune_learning_rate=1e-5,
+        finetune_last_layers=50,     # unfreeze last 50 layers
+        batch_size=16,
+        learning_rate=1e-4,
+        lr_schedule="constant",
+        loss="mse",
+        use_swa=False,
+        aug_rotation=True,
+        aug_crop_jitter=True,
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        nme_mode="iod",
+        patience=50,
+    ),
+    "heatmap_v2s_best": ExperimentConfig(
+        name="heatmap_v2s_best",
+        backbone="efficientnetv2s",
+        head_type="heatmap",
+        heatmap_dropout=0.1,
+        epochs=100,
+        finetune_epochs=200,
+        finetune_learning_rate=1e-5,
+        finetune_last_layers=50,
+        batch_size=16,
+        learning_rate=1e-4,
+        lr_schedule="constant",
+        loss="mse",
+        optimizer="adamw",
+        weight_decay=1e-4,
+        use_swa=False,
+        aug_rotation=True,
+        aug_flip=True,
+        aug_crop_jitter=True,
+        aug_crop_jitter_frac=0.08,
+        aug_scale=True,
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        nme_mode="iod",
+        patience=50,
+    ),
+    "heatmap_v2s_flip": ExperimentConfig(
+        name="heatmap_v2s_flip",
+        backbone="efficientnetv2s",
+        head_type="heatmap",
+        epochs=300,
+        finetune_epochs=0,
+        batch_size=16,
+        learning_rate=1e-4,
+        lr_schedule="constant",
+        loss="mse",
+        optimizer="adamw",
+        weight_decay=1e-4,
+        use_swa=False,
+        aug_rotation=True,
+        aug_flip=True,
+        aug_crop_jitter=True,
+        aug_crop_jitter_frac=0.08,
+        aug_scale=True,
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        nme_mode="iod",
+        patience=50,
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -56,24 +375,101 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--data-root", type=Path, default=default_root)
     p.add_argument("--out-dir", type=Path, default=Path("artifacts/dog_face_landmarks"))
-    p.add_argument("--img-size", type=int, default=224,
-                   help="Square crop size fed to landmark model")
-    p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--epochs", type=int, default=15,
-                   help="Frozen-backbone epochs")
-    p.add_argument("--finetune-epochs", type=int, default=60)
-    p.add_argument("--finetune-last-layers", type=int, default=120)
-    p.add_argument("--learning-rate", type=float, default=1e-3)
-    p.add_argument("--finetune-learning-rate", type=float, default=1e-4)
-    p.add_argument("--lm-margin", type=float, default=0.12,
-                   help="Margin applied to landmark span to derive GT bbox")
-    p.add_argument("--crop-margin", type=float, default=0.20,
-                   help="Extra margin added around GT bbox before cropping")
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--no-pretrained", action="store_true")
+    p.add_argument("--img-size", type=int, default=None)
+    p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--finetune-epochs", type=int, default=None)
+    p.add_argument("--finetune-last-layers", type=int, default=None)
+    p.add_argument("--learning-rate", type=float, default=None)
+    p.add_argument("--finetune-learning-rate", type=float, default=None)
+    p.add_argument("--lm-margin", type=float, default=None)
+    p.add_argument("--crop-margin", type=float, default=None)
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--no-pretrained", action="store_true", default=False)
     p.add_argument("--skip-finetune", action="store_true")
     p.add_argument("--tflite-only", action="store_true")
+
+    # --- Experiment framework flags ---
+    p.add_argument("--experiment", type=str, default=None,
+                   help="Named experiment preset: 'paper_baseline', 'current', etc.")
+    p.add_argument("--loss", choices=["mse", "wing"], default=None)
+    p.add_argument("--lr-schedule", choices=["constant", "cosine"], default=None)
+    p.add_argument("--use-swa", action="store_true", default=None)
+    p.add_argument("--no-swa", dest="use_swa", action="store_false")
+    p.add_argument("--nme-mode", choices=["crop", "iod"], default=None)
+    p.add_argument("--backbone", choices=["efficientnetb2", "efficientnetv2s"], default=None)
+    p.add_argument("--head-type", choices=["dense", "heatmap"], default=None)
+    p.add_argument("--unfreeze-backbone", action="store_true", default=None)
+    p.add_argument("--no-unfreeze-backbone", dest="unfreeze_backbone", action="store_false")
+    p.add_argument("--patience", type=int, default=None)
+    p.add_argument("--aug-blur", action="store_true", default=None)
+    p.add_argument("--no-aug-blur", dest="aug_blur", action="store_false")
+    p.add_argument("--aug-noise", action="store_true", default=None)
+    p.add_argument("--no-aug-noise", dest="aug_noise", action="store_false")
+    p.add_argument("--aug-sharpness", action="store_true", default=None)
+    p.add_argument("--no-aug-sharpness", dest="aug_sharpness", action="store_false")
+    p.add_argument("--aug-color-balance", action="store_true", default=None)
+    p.add_argument("--no-aug-color-balance", dest="aug_color_balance", action="store_false")
+    p.add_argument("--aug-crop-jitter", action="store_true", default=None)
+    p.add_argument("--no-aug-crop-jitter", dest="aug_crop_jitter", action="store_false")
+    p.add_argument("--aug-flip", action="store_true", default=None)
+    p.add_argument("--no-aug-flip", dest="aug_flip", action="store_false")
+    p.add_argument("--aug-scale", action="store_true", default=None)
+    p.add_argument("--no-aug-scale", dest="aug_scale", action="store_false")
+    p.add_argument("--optimizer", choices=["adam", "adamw"], default=None)
     return p.parse_args()
+
+
+def resolve_config(args: argparse.Namespace) -> ExperimentConfig:
+    """Build an ExperimentConfig from a preset + CLI overrides."""
+    if args.experiment:
+        if args.experiment in EXPERIMENT_PRESETS:
+            cfg = copy.deepcopy(EXPERIMENT_PRESETS[args.experiment])
+        else:
+            raise ValueError(f"Unknown experiment preset: {args.experiment}")
+    else:
+        # Default: paper_baseline
+        cfg = copy.deepcopy(EXPERIMENT_PRESETS["paper_baseline"])
+
+    # Apply explicit CLI overrides (only if not None).
+    _override = {
+        "img_size": args.img_size,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "finetune_epochs": args.finetune_epochs,
+        "finetune_last_layers": args.finetune_last_layers,
+        "learning_rate": args.learning_rate,
+        "finetune_learning_rate": args.finetune_learning_rate,
+        "lm_margin": args.lm_margin,
+        "crop_margin": args.crop_margin,
+        "seed": args.seed,
+        "no_pretrained": args.no_pretrained or None,
+        "loss": args.loss,
+        "lr_schedule": args.lr_schedule,
+        "use_swa": args.use_swa,
+        "nme_mode": args.nme_mode,
+        "backbone": args.backbone,
+        "head_type": args.head_type,
+        "unfreeze_backbone": args.unfreeze_backbone,
+        "patience": args.patience,
+        "aug_blur": args.aug_blur,
+        "aug_noise": args.aug_noise,
+        "aug_sharpness": args.aug_sharpness,
+        "aug_color_balance": args.aug_color_balance,
+        "aug_crop_jitter": args.aug_crop_jitter,
+        "aug_flip": args.aug_flip,
+        "aug_scale": args.aug_scale,
+        "optimizer": args.optimizer,
+    }
+    for key, val in _override.items():
+        if val is not None:
+            setattr(cfg, key, val)
+
+    # Legacy flag compat
+    if args.skip_finetune:
+        cfg.finetune_epochs = 0
+
+    return cfg
 
 
 def set_seed(seed: int) -> None:
@@ -176,11 +572,8 @@ def load_split_records(data_root: Path, split: str, lm_margin: float) -> list[Re
 
 def build_tf_dataset(
     records: list[Record],
-    img_size: int,
-    crop_margin: float,
-    batch_size: int,
+    cfg: ExperimentConfig,
     training: bool,
-    seed: int,
 ) -> tf.data.Dataset:
     paths = np.array([r.image_path for r in records], dtype=object)
     boxes = np.array([r.bbox_xyxy_abs for r in records], dtype=np.float32)
@@ -191,7 +584,10 @@ def build_tf_dataset(
 
     ds = tf.data.Dataset.from_tensor_slices((paths, boxes, lmarks))
     if training:
-        ds = ds.shuffle(len(records), seed=seed, reshuffle_each_iteration=True)
+        ds = ds.shuffle(len(records), seed=cfg.seed, reshuffle_each_iteration=True)
+
+    img_size = cfg.img_size
+    crop_margin = cfg.crop_margin
 
     def _load_and_crop(
         path: tf.Tensor,
@@ -202,16 +598,21 @@ def build_tf_dataset(
         image = tf.io.decode_png(img_bytes, channels=3)
         image = tf.image.convert_image_dtype(image, tf.float32)
         box_aug = box_abs
-        if training:
-            box_aug = jitter_crop_box(box_abs, image)
+        if training and cfg.aug_scale:
+            box_aug = scale_crop_box(box_aug, image, cfg.aug_scale_range)
+        if training and cfg.aug_crop_jitter:
+            box_aug = jitter_crop_box(box_aug, image, cfg.aug_crop_jitter_frac)
         crop, lm_norm = crop_and_normalize(image, box_aug, lm_flat, img_size, crop_margin)
         if training:
-            crop, lm_norm = rotate_augment(crop, lm_norm, img_size)
-            crop = photometric_augment(crop)
+            if cfg.aug_rotation:
+                crop, lm_norm = rotate_augment(crop, lm_norm, img_size, cfg.aug_rotation_deg)
+            if cfg.aug_flip:
+                crop, lm_norm = flip_augment(crop, lm_norm)
+            crop = photometric_augment(crop, cfg)
         return crop, lm_norm
 
     ds = ds.map(_load_and_crop, num_parallel_calls=tf.data.AUTOTUNE)
-    ds = ds.batch(batch_size)
+    ds = ds.batch(cfg.batch_size)
     ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds
 
@@ -289,6 +690,25 @@ def jitter_crop_box(
     return tf.stack([x1, y1, x2, y2])
 
 
+def scale_crop_box(
+    bbox_abs: tf.Tensor, image: tf.Tensor,
+    scale_range: tuple = (0.85, 1.15),
+) -> tf.Tensor:
+    """Randomly scale the crop box to simulate different face sizes."""
+    img_h = tf.cast(tf.shape(image)[0], tf.float32)
+    img_w = tf.cast(tf.shape(image)[1], tf.float32)
+    x1, y1, x2, y2 = bbox_abs[0], bbox_abs[1], bbox_abs[2], bbox_abs[3]
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    bw, bh = x2 - x1, y2 - y1
+    scale = tf.random.uniform((), scale_range[0], scale_range[1])
+    new_bw, new_bh = bw * scale, bh * scale
+    x1 = tf.clip_by_value(cx - new_bw / 2.0, 0.0, img_w)
+    y1 = tf.clip_by_value(cy - new_bh / 2.0, 0.0, img_h)
+    x2 = tf.clip_by_value(cx + new_bw / 2.0, 0.0, img_w)
+    y2 = tf.clip_by_value(cy + new_bh / 2.0, 0.0, img_h)
+    return tf.stack([x1, y1, x2, y2])
+
+
 def rotate_augment(
     crop: tf.Tensor, lm_norm_flat: tf.Tensor, img_size: int,
     max_deg: float = 15.0,
@@ -336,10 +756,73 @@ def _rotation_matrix(angle_rad: tf.Tensor, img_size: int) -> tf.Tensor:
     )
 
 
-def photometric_augment(image: tf.Tensor) -> tf.Tensor:
-    image = tf.image.random_brightness(image, max_delta=0.10)
-    image = tf.image.random_contrast(image, lower=0.80, upper=1.20)
-    image = tf.image.random_saturation(image, lower=0.80, upper=1.20)
+def flip_augment(
+    crop: tf.Tensor, lm_norm_flat: tf.Tensor,
+) -> tuple[tf.Tensor, tf.Tensor]:
+    """Random horizontal flip with landmark index swapping (50% probability)."""
+    do_flip = tf.random.uniform(()) < 0.5
+    flip_idx = tf.constant(FLIP_INDEX, dtype=tf.int32)
+
+    flipped_img = tf.image.flip_left_right(crop)
+    lm = tf.reshape(lm_norm_flat, [NUM_LANDMARKS, 2])
+    lm_flipped = tf.gather(lm, flip_idx, axis=0)
+    lm_flipped = tf.stack([1.0 - lm_flipped[:, 0], lm_flipped[:, 1]], axis=-1)
+    lm_flipped_flat = tf.reshape(lm_flipped, [NUM_LANDMARKS * 2])
+
+    crop_out = tf.where(do_flip, flipped_img, crop)
+    lm_out = tf.where(do_flip, lm_flipped_flat, lm_norm_flat)
+    return crop_out, lm_out
+
+
+def augment_gaussian_blur(image: tf.Tensor) -> tf.Tensor:
+    """Random average-pooling blur (50% probability)."""
+    img_4d = tf.expand_dims(image, 0)
+    blurred = tf.nn.avg_pool2d(img_4d, ksize=3, strides=1, padding="SAME")
+    blurred = tf.squeeze(blurred, 0)
+    do_blur = tf.random.uniform(()) < 0.5
+    return tf.where(do_blur, blurred, image)
+
+
+def augment_gaussian_noise(image: tf.Tensor, max_stddev: float = 0.05) -> tf.Tensor:
+    """Add random Gaussian noise."""
+    stddev = tf.random.uniform((), 0.0, max_stddev)
+    noise = tf.random.normal(tf.shape(image), stddev=stddev)
+    return tf.clip_by_value(image + noise, 0.0, 1.0)
+
+
+def augment_sharpness(image: tf.Tensor) -> tf.Tensor:
+    """Random sharpness alteration via unsharp mask."""
+    factor = tf.random.uniform((), 0.5, 2.0)
+    img_4d = tf.expand_dims(image, 0)
+    blurred = tf.nn.avg_pool2d(img_4d, ksize=3, strides=1, padding="SAME")
+    blurred = tf.squeeze(blurred, 0)
+    sharpened = image + factor * (image - blurred)
+    return tf.clip_by_value(sharpened, 0.0, 1.0)
+
+
+def augment_color_balance(image: tf.Tensor, max_shift: float = 0.05) -> tf.Tensor:
+    """Random per-channel intensity shift."""
+    shifts = tf.random.uniform([3], -max_shift, max_shift)
+    return tf.clip_by_value(image + shifts, 0.0, 1.0)
+
+
+def photometric_augment(image: tf.Tensor, cfg: ExperimentConfig) -> tf.Tensor:
+    if cfg.aug_brightness:
+        image = tf.image.random_brightness(image, max_delta=cfg.aug_brightness_delta)
+    if cfg.aug_contrast:
+        image = tf.image.random_contrast(
+            image, lower=cfg.aug_contrast_range[0], upper=cfg.aug_contrast_range[1])
+    if cfg.aug_saturation:
+        image = tf.image.random_saturation(
+            image, lower=cfg.aug_saturation_range[0], upper=cfg.aug_saturation_range[1])
+    if cfg.aug_color_balance:
+        image = augment_color_balance(image)
+    if cfg.aug_sharpness:
+        image = augment_sharpness(image)
+    if cfg.aug_blur:
+        image = augment_gaussian_blur(image)
+    if cfg.aug_noise:
+        image = augment_gaussian_noise(image)
     return tf.clip_by_value(image, 0.0, 1.0)
 
 
@@ -378,6 +861,33 @@ def landmark_nme(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
     return tf.reduce_mean(dist)
 
 
+def landmark_nme_iod(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+    """NME normalized by inter-ocular distance (IOD).
+
+    IOD = Euclidean distance between outer corners of left and right eyes
+    (landmarks 18 and 19).  This is the standard metric used in the DogFLW
+    benchmark paper.  Returns a percentage value — typical good values < 7.0.
+    """
+    true_2d = tf.reshape(y_true, [-1, NUM_LANDMARKS, 2])
+    pred_2d = tf.reshape(y_pred, [-1, NUM_LANDMARKS, 2])
+
+    # Outer eye corners from ground truth.
+    left_eye_outer = true_2d[:, LEFT_OUTER_EYE_IDX, :]    # [B, 2]
+    right_eye_outer = true_2d[:, RIGHT_OUTER_EYE_IDX, :]  # [B, 2]
+
+    iod = tf.sqrt(
+        tf.reduce_sum(tf.square(left_eye_outer - right_eye_outer), axis=-1) + 1e-8
+    )  # [B]
+
+    # Per-landmark Euclidean distance.
+    diff = pred_2d - true_2d  # [B, 46, 2]
+    dist = tf.sqrt(tf.reduce_sum(tf.square(diff), axis=-1) + 1e-8)  # [B, 46]
+    mean_dist = tf.reduce_mean(dist, axis=-1)  # [B]
+
+    nme = mean_dist / tf.maximum(iod, 1e-8)  # [B]
+    return tf.reduce_mean(nme) * 100.0
+
+
 # ---------------------------------------------------------------------------
 # SWA (Stochastic Weight Averaging)
 # ---------------------------------------------------------------------------
@@ -407,44 +917,164 @@ class SWACallback(tf.keras.callbacks.Callback):
 
 
 # ---------------------------------------------------------------------------
+# Heatmap head components
+# ---------------------------------------------------------------------------
+
+@tf.keras.utils.register_keras_serializable(package="DogFLW")
+class SoftArgmax2D(tf.keras.layers.Layer):
+    """Extract (x, y) coordinates from heatmaps via differentiable soft-argmax.
+
+    Input:  (B, H, W, K) — K heatmaps of spatial size H×W
+    Output: (B, K*2) — flattened [x0, y0, x1, y1, ...] in [0, 1]
+
+    All ops are TFLite-compatible (softmax, multiply, reduce_sum, constants).
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def build(self, input_shape):
+        _, h, w, _ = input_shape
+        # Coordinate grids normalized to [0, 1].
+        # x varies along width (axis=1), y varies along height (axis=0).
+        x_coords = tf.linspace(0.0, 1.0, w)  # [W]
+        y_coords = tf.linspace(0.0, 1.0, h)  # [H]
+        # Broadcast-ready shapes: x_grid [1, 1, W, 1], y_grid [1, H, 1, 1]
+        self.x_grid = tf.reshape(x_coords, [1, 1, w, 1])
+        self.y_grid = tf.reshape(y_coords, [1, h, 1, 1])
+        super().build(input_shape)
+
+    def call(self, heatmaps):
+        # heatmaps: (B, H, W, K)
+        b = tf.shape(heatmaps)[0]
+        h = tf.shape(heatmaps)[1]
+        w = tf.shape(heatmaps)[2]
+        k = tf.shape(heatmaps)[3]
+
+        # Spatial softmax: flatten H*W, softmax, reshape back.
+        flat = tf.reshape(heatmaps, [b, h * w, k])        # (B, H*W, K)
+        weights = tf.nn.softmax(flat, axis=1)               # (B, H*W, K)
+        weights = tf.reshape(weights, [b, h, w, k])         # (B, H, W, K)
+
+        # Weighted sum of coordinates.
+        x = tf.reduce_sum(weights * self.x_grid, axis=[1, 2])  # (B, K)
+        y = tf.reduce_sum(weights * self.y_grid, axis=[1, 2])  # (B, K)
+
+        # Interleave as [x0, y0, x1, y1, ...].
+        coords = tf.stack([x, y], axis=-1)  # (B, K, 2)
+        return tf.reshape(coords, [b, k * 2])  # (B, K*2)
+
+    def get_config(self):
+        return super().get_config()
+
+
+def _build_deconv_head(backbone_output, num_landmarks: int, channels: int,
+                       dropout: float = 0.0):
+    """SimpleBaseline-style deconv head: 3× deconv + 1×1 conv + soft-argmax.
+
+    backbone_output: (B, 7, 7, C) feature map from EfficientNet
+    Returns: (B, num_landmarks*2) coordinates in [0, 1]
+    """
+    x = backbone_output
+
+    # 3 deconv blocks: 7→14→28→56
+    for i in range(3):
+        x = tf.keras.layers.Conv2DTranspose(
+            channels, kernel_size=4, strides=2, padding="same",
+            use_bias=False, name=f"deconv_{i+1}",
+        )(x)
+        x = tf.keras.layers.BatchNormalization(name=f"deconv_bn_{i+1}")(x)
+        x = tf.keras.layers.ReLU(name=f"deconv_relu_{i+1}")(x)
+        if dropout > 0:
+            x = tf.keras.layers.SpatialDropout2D(dropout, name=f"deconv_drop_{i+1}")(x)
+
+    # 1×1 conv to produce one heatmap per landmark.
+    heatmaps = tf.keras.layers.Conv2D(
+        num_landmarks, kernel_size=1, padding="same",
+        name="heatmap_conv",
+    )(x)  # (B, 56, 56, num_landmarks)
+
+    # Differentiable coordinate extraction.
+    coords = SoftArgmax2D(name="soft_argmax")(heatmaps)  # (B, num_landmarks*2)
+    return coords
+
+
+# ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
 
-def build_model(img_size: int, pretrained: bool) -> tf.keras.Model:
+def build_model(cfg: ExperimentConfig) -> tf.keras.Model:
+    img_size = cfg.img_size
+    pretrained = not cfg.no_pretrained
     inputs = tf.keras.Input(shape=(img_size, img_size, 3), name="crop")
-    # EfficientNetB0 has its own preprocessing (expects [0, 255]).
+    # EfficientNet expects [0, 255] input.
     x = tf.keras.layers.Rescaling(scale=255.0, offset=0.0, name="to_0_255")(inputs)
 
-    backbone = tf.keras.applications.EfficientNetB2(
-        input_shape=(img_size, img_size, 3),
-        include_top=False,
-        weights=None if not pretrained else "imagenet",
-    )
+    if cfg.backbone == "efficientnetv2s":
+        backbone = tf.keras.applications.EfficientNetV2S(
+            input_shape=(img_size, img_size, 3),
+            include_top=False,
+            weights=None if not pretrained else "imagenet",
+        )
+    else:  # efficientnetb2
+        backbone = tf.keras.applications.EfficientNetB2(
+            input_shape=(img_size, img_size, 3),
+            include_top=False,
+            weights=None if not pretrained else "imagenet",
+        )
     backbone.trainable = False
     x = backbone(x, training=False)
 
-    x = tf.keras.layers.GlobalAveragePooling2D()(x)
-    x = tf.keras.layers.Dense(1024, activation="relu")(x)
-    x = tf.keras.layers.Dropout(0.25)(x)
-    x = tf.keras.layers.Dense(512, activation="relu")(x)
-    x = tf.keras.layers.Dense(256, activation="relu")(x)
-    outputs = tf.keras.layers.Dense(
-        NUM_LANDMARKS * 2, activation="sigmoid", name="landmarks_xy"
-    )(x)
+    if cfg.head_type == "heatmap":
+        # Deconv upsampling + heatmap + soft-argmax (preserves spatial info).
+        outputs = _build_deconv_head(x, NUM_LANDMARKS, cfg.heatmap_channels,
+                                     dropout=cfg.heatmap_dropout)
+        # Rename for consistency with dense head output.
+        outputs = tf.keras.layers.Identity(name="landmarks_xy")(outputs)
+    else:
+        # Original dense head (GAP destroys spatial info).
+        x = tf.keras.layers.GlobalAveragePooling2D()(x)
+        x = tf.keras.layers.Dense(1024, activation="relu")(x)
+        x = tf.keras.layers.Dropout(0.25)(x)
+        x = tf.keras.layers.Dense(512, activation="relu")(x)
+        x = tf.keras.layers.Dense(256, activation="relu")(x)
+        outputs = tf.keras.layers.Dense(
+            NUM_LANDMARKS * 2, activation="sigmoid", name="landmarks_xy"
+        )(x)
 
     return tf.keras.Model(inputs=inputs, outputs=outputs, name="dog_face_landmark_regressor")
 
 
-def compile_model(model: tf.keras.Model, lr) -> None:
-    try:
-        optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=lr)
-    except AttributeError:
-        optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+def _make_wing_loss(omega: float, epsilon: float):
+    """Return a Wing loss function with baked-in parameters (Keras-serializable)."""
+    @tf.keras.utils.register_keras_serializable(package="DogFLW")
+    def wing_loss_fn(y_true, y_pred):
+        return wing_loss(y_true, y_pred, omega=omega, epsilon=epsilon)
+    return wing_loss_fn
+
+
+def compile_model(model: tf.keras.Model, lr, cfg: ExperimentConfig) -> None:
+    if cfg.optimizer == "adamw":
+        try:
+            optimizer = tf.keras.optimizers.AdamW(learning_rate=lr, weight_decay=cfg.weight_decay)
+        except AttributeError:
+            optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+    else:
+        try:
+            optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=lr)
+        except AttributeError:
+            optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+
+    if cfg.loss == "mse":
+        loss_fn = tf.keras.losses.MeanSquaredError()
+    else:
+        loss_fn = _make_wing_loss(cfg.wing_omega, cfg.wing_epsilon)
+
     model.compile(
         optimizer=optimizer,
-        loss=wing_loss,
-        metrics=[landmark_nme],
-        run_eagerly=True,
+        loss=loss_fn,
+        metrics=[landmark_nme, landmark_nme_iod],
+        run_eagerly=False,
     )
 
 
@@ -453,6 +1083,56 @@ def get_backbone(model: tf.keras.Model) -> tf.keras.Model:
         if isinstance(layer, tf.keras.Model) and layer.name.startswith("efficientnet"):
             return layer
     raise RuntimeError("EfficientNet backbone not found")
+
+
+class WarmupSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+    """Linear warmup then delegates to an inner schedule (or constant)."""
+
+    def __init__(self, inner, warmup_steps: int):
+        super().__init__()
+        self.inner = inner
+        self.warmup_steps = warmup_steps
+        self._peak_lr = float(inner) if isinstance(inner, (int, float)) else inner.initial_learning_rate
+
+    def __call__(self, step):
+        step_f = tf.cast(step, tf.float32)
+        warmup = tf.minimum(step_f / tf.maximum(tf.cast(self.warmup_steps, tf.float32), 1.0), 1.0)
+        if isinstance(self.inner, (int, float)):
+            return self._peak_lr * warmup
+        return self.inner(step) * warmup
+
+    def get_config(self):
+        return {"inner": self.inner, "warmup_steps": self.warmup_steps}
+
+
+def build_lr_schedule(cfg: ExperimentConfig, num_train: int, total_epochs: int):
+    """Build a learning rate or schedule from config."""
+    steps_per_epoch = math.ceil(num_train / cfg.batch_size)
+
+    if cfg.lr_schedule == "cosine":
+        total_steps = steps_per_epoch * total_epochs
+        schedule = tf.keras.optimizers.schedules.CosineDecay(
+            initial_learning_rate=cfg.learning_rate,
+            decay_steps=total_steps,
+            alpha=cfg.lr_min,
+        )
+    else:
+        schedule = cfg.learning_rate
+
+    # Only apply warmup when fine-tuning pretrained backbone layers.
+    if cfg.unfreeze_backbone:
+        warmup_steps = steps_per_epoch * 5
+        return WarmupSchedule(schedule, warmup_steps)
+
+    return schedule
+
+
+def _monitor_metric(cfg: ExperimentConfig) -> str:
+    return "val_landmark_nme_iod" if cfg.nme_mode == "iod" else "val_landmark_nme"
+
+
+def _score_key(cfg: ExperimentConfig) -> str:
+    return "landmark_nme_iod" if cfg.nme_mode == "iod" else "landmark_nme"
 
 
 # ---------------------------------------------------------------------------
@@ -464,110 +1144,146 @@ def train_model(
     train_ds: tf.data.Dataset,
     val_ds: tf.data.Dataset,
     out_dir: Path,
-    args: argparse.Namespace,
+    cfg: ExperimentConfig,
     num_train: int,
 ) -> tf.keras.Model:
     out_dir.mkdir(parents=True, exist_ok=True)
+    monitor = _monitor_metric(cfg)
+    score_key = _score_key(cfg)
 
-    phase1_callbacks = [
-        tf.keras.callbacks.EarlyStopping(
-            monitor="val_landmark_nme",
-            mode="min",
-            patience=6,
-            restore_best_weights=True,
-            verbose=1,
-        ),
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor="val_landmark_nme",
-            mode="min",
-            factor=0.5,
-            patience=3,
-            min_lr=1e-6,
-            verbose=1,
-        ),
-        tf.keras.callbacks.CSVLogger(str(out_dir / "train_log.csv"), append=False),
-    ]
+    if cfg.finetune_epochs == 0:
+        # === SINGLE-PHASE TRAINING ===
+        if cfg.unfreeze_backbone:
+            backbone = get_backbone(model)
+            backbone.trainable = True
+            for layer in backbone.layers:
+                if isinstance(layer, tf.keras.layers.BatchNormalization):
+                    layer.trainable = False
 
-    print("\n=== Phase 1: frozen backbone ===")
-    compile_model(model, lr=args.learning_rate)
-    model.fit(
-        train_ds,
-        validation_data=val_ds,
-        epochs=max(args.epochs, 0),
-        callbacks=phase1_callbacks,
-        verbose=2,
-    )
-    p1_metrics = evaluate_model(model, val_ds)
-    p1_score = float(p1_metrics.get("landmark_nme", float("inf")))
-    p1_state = [np.array(w, copy=True) for w in model.get_weights()]
+        lr = build_lr_schedule(cfg, num_train, cfg.epochs)
+        compile_model(model, lr=lr, cfg=cfg)
 
-    best_score = p1_score
-    best_source = "phase1"
-    best_state = p1_state
+        callbacks = [
+            tf.keras.callbacks.EarlyStopping(
+                monitor=monitor, mode="min",
+                patience=cfg.patience, restore_best_weights=True, verbose=1,
+            ),
+            tf.keras.callbacks.CSVLogger(str(out_dir / "train_log.csv"), append=False),
+        ]
+        # ReduceLROnPlateau is only compatible with constant LR (not schedules).
+        if cfg.lr_schedule == "constant":
+            callbacks.insert(1, tf.keras.callbacks.ReduceLROnPlateau(
+                monitor=monitor, mode="min",
+                factor=0.5, patience=5, min_lr=1e-6, verbose=1,
+            ))
 
-    if not args.skip_finetune and args.finetune_epochs > 0:
-        print("\n=== Phase 2: fine-tune backbone tail ===")
+        swa_cb = None
+        if cfg.use_swa:
+            swa_start = int(cfg.epochs * cfg.swa_start_frac)
+            swa_cb = SWACallback(start_epoch=swa_start)
+            callbacks.append(swa_cb)
+
+        print(f"\n=== Single-phase training: {cfg.epochs} epochs ===")
+        model.fit(
+            train_ds, validation_data=val_ds,
+            epochs=max(cfg.epochs, 0),
+            callbacks=callbacks, verbose=2,
+        )
+        best_metrics = evaluate_model(model, val_ds)
+        best_score = float(best_metrics.get(score_key, float("inf")))
+        best_source = "single_phase"
+        best_state = [np.array(w, copy=True) for w in model.get_weights()]
+
+        # Try SWA if enabled
+        if swa_cb is not None:
+            swa_weights = swa_cb.get_averaged_weights()
+            if swa_weights is not None:
+                model.set_weights(swa_weights)
+                swa_metrics = evaluate_model(model, val_ds)
+                swa_score = float(swa_metrics.get(score_key, float("inf")))
+                print(f"SWA {score_key}={swa_score:.6f}")
+                if swa_score <= best_score:
+                    best_score = swa_score
+                    best_source = "swa"
+                    best_state = [np.array(w, copy=True) for w in swa_weights]
+    else:
+        # === TWO-PHASE TRAINING ===
+        phase1_callbacks = [
+            tf.keras.callbacks.EarlyStopping(
+                monitor=monitor, mode="min",
+                patience=min(cfg.patience, 6), restore_best_weights=True, verbose=1,
+            ),
+            tf.keras.callbacks.ReduceLROnPlateau(
+                monitor=monitor, mode="min",
+                factor=0.5, patience=3, min_lr=1e-6, verbose=1,
+            ),
+            tf.keras.callbacks.CSVLogger(str(out_dir / "train_log.csv"), append=False),
+        ]
+
+        print(f"\n=== Phase 1: frozen backbone, {cfg.epochs} epochs ===")
+        compile_model(model, lr=cfg.learning_rate, cfg=cfg)
+        model.fit(
+            train_ds, validation_data=val_ds,
+            epochs=max(cfg.epochs, 0),
+            callbacks=phase1_callbacks, verbose=2,
+        )
+        p1_metrics = evaluate_model(model, val_ds)
+        best_score = float(p1_metrics.get(score_key, float("inf")))
+        best_source = "phase1"
+        best_state = [np.array(w, copy=True) for w in model.get_weights()]
+
+        print(f"\n=== Phase 2: fine-tune backbone tail, {cfg.finetune_epochs} epochs ===")
         backbone = get_backbone(model)
         backbone.trainable = True
-        if args.finetune_last_layers > 0:
-            for layer in backbone.layers[: -args.finetune_last_layers]:
+        if cfg.finetune_last_layers > 0:
+            for layer in backbone.layers[:-cfg.finetune_last_layers]:
                 layer.trainable = False
         for layer in backbone.layers:
             if isinstance(layer, tf.keras.layers.BatchNormalization):
                 layer.trainable = False
 
-        # Cosine decay LR schedule
-        steps_per_epoch = math.ceil(num_train / args.batch_size)
-        total_steps = steps_per_epoch * args.finetune_epochs
-        cosine_lr = tf.keras.optimizers.schedules.CosineDecay(
-            initial_learning_rate=args.finetune_learning_rate,
-            decay_steps=total_steps,
-            alpha=1e-6,
-        )
-        compile_model(model, lr=cosine_lr)
+        # Use warmup for backbone fine-tuning to avoid destroying pretrained weights.
+        steps_per_epoch = math.ceil(num_train / cfg.batch_size)
+        warmup_steps = steps_per_epoch * 5  # 5-epoch warmup for Phase 2
+        ft_lr = WarmupSchedule(cfg.finetune_learning_rate, warmup_steps)
+        compile_model(model, lr=ft_lr, cfg=cfg)
 
-        swa_cb = SWACallback(start_epoch=args.finetune_epochs // 2)
+        swa_cb = SWACallback(start_epoch=cfg.finetune_epochs // 2) if cfg.use_swa else None
         phase2_callbacks = [
             tf.keras.callbacks.EarlyStopping(
-                monitor="val_landmark_nme",
-                mode="min",
-                patience=12,
-                restore_best_weights=True,
-                verbose=1,
+                monitor=monitor, mode="min",
+                patience=cfg.patience, restore_best_weights=True, verbose=1,
             ),
-            tf.keras.callbacks.CSVLogger(
-                str(out_dir / "train_log.csv"), append=True
-            ),
-            swa_cb,
+            tf.keras.callbacks.CSVLogger(str(out_dir / "train_log.csv"), append=True),
         ]
+        if swa_cb is not None:
+            phase2_callbacks.append(swa_cb)
+
         model.fit(
-            train_ds,
-            validation_data=val_ds,
-            epochs=max(args.finetune_epochs, 0),
-            callbacks=phase2_callbacks,
-            verbose=2,
+            train_ds, validation_data=val_ds,
+            epochs=max(cfg.finetune_epochs, 0),
+            callbacks=phase2_callbacks, verbose=2,
         )
         p2_metrics = evaluate_model(model, val_ds)
-        p2_score = float(p2_metrics.get("landmark_nme", float("inf")))
-        p2_weights = [np.array(w, copy=True) for w in model.get_weights()]
+        p2_score = float(p2_metrics.get(score_key, float("inf")))
         if p2_score <= best_score:
             best_score = p2_score
             best_source = "phase2"
-            best_state = p2_weights
+            best_state = [np.array(w, copy=True) for w in model.get_weights()]
 
-        # Try SWA averaged weights
-        swa_weights = swa_cb.get_averaged_weights()
-        if swa_weights is not None:
-            model.set_weights(swa_weights)
-            swa_metrics = evaluate_model(model, val_ds)
-            swa_score = float(swa_metrics.get("landmark_nme", float("inf")))
-            print(f"SWA val_landmark_nme={swa_score:.6f}")
-            if swa_score <= best_score:
-                best_score = swa_score
-                best_source = "swa"
-                best_state = [np.array(w, copy=True) for w in swa_weights]
+        if swa_cb is not None:
+            swa_weights = swa_cb.get_averaged_weights()
+            if swa_weights is not None:
+                model.set_weights(swa_weights)
+                swa_metrics = evaluate_model(model, val_ds)
+                swa_score = float(swa_metrics.get(score_key, float("inf")))
+                print(f"SWA {score_key}={swa_score:.6f}")
+                if swa_score <= best_score:
+                    best_score = swa_score
+                    best_source = "swa"
+                    best_state = [np.array(w, copy=True) for w in swa_weights]
 
-    print(f"Selecting {best_source} model (val_landmark_nme={best_score:.6f})")
+    print(f"Selecting {best_source} model ({score_key}={best_score:.6f})")
     model.set_weights(best_state)
     model.save(out_dir / "best.keras")
     model.save_weights(out_dir / "best.weights.h5")
@@ -644,43 +1360,33 @@ def tflite_sanity_check(
 
 def save_metadata(
     out_dir: Path,
-    img_size: int,
-    crop_margin: float,
+    cfg: ExperimentConfig,
+    data_root: Path,
     train_records: list[Record],
     val_records: list[Record],
     val_metrics: dict[str, float],
     tflite_path: Path,
     tflite_sanity: dict[str, float],
-    args: argparse.Namespace,
 ) -> None:
     meta = {
         "model_name": "dog_face_landmark_regressor",
         "num_landmarks": NUM_LANDMARKS,
-        "data_root": str(args.data_root),
+        "data_root": str(data_root),
         "dataset": "DogFLW",
         "train_samples": len(train_records),
         "val_samples": len(val_records),
         "input": {
-            "shape": [1, img_size, img_size, 3],
+            "shape": [1, cfg.img_size, cfg.img_size, 3],
             "dtype": "float32",
             "range": [0.0, 1.0],
-            "preprocessing": "crop to GT/pred bbox + margin, resize to square, rescale to [0,255] for EfficientNetB0 in-model",
+            "preprocessing": f"crop to GT/pred bbox + margin, resize to square, rescale to [0,255] for {cfg.backbone} in-model",
         },
         "output": {
             "name": "landmarks_xy",
             "format": "flattened [x0,y0, x1,y1, ..., x45,y45] normalized in [0,1] relative to crop",
             "shape": [1, NUM_LANDMARKS * 2],
         },
-        "training": {
-            "lm_margin": args.lm_margin,
-            "crop_margin": crop_margin,
-            "img_size": img_size,
-            "batch_size": args.batch_size,
-            "epochs_frozen": args.epochs,
-            "epochs_finetune": 0 if args.skip_finetune else args.finetune_epochs,
-            "pretrained_backbone": not args.no_pretrained,
-            "seed": args.seed,
-        },
+        "experiment_config": asdict(cfg),
         "validation_metrics": val_metrics,
         "tflite_sanity": tflite_sanity,
         "artifacts": {
@@ -700,34 +1406,31 @@ def save_metadata(
 
 def main() -> None:
     args = parse_args()
+    cfg = resolve_config(args)
     configure_ca_bundle()
-    set_seed(args.seed)
+    set_seed(cfg.seed)
     tf.config.optimizer.set_jit(False)
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"TensorFlow: {tf.__version__}")
+    print(f"Experiment: {cfg.name} | backbone={cfg.backbone} loss={cfg.loss} "
+          f"epochs={cfg.epochs} ft_epochs={cfg.finetune_epochs} batch={cfg.batch_size}")
     if not args.data_root.exists():
         raise FileNotFoundError(f"DogFLW not found at {args.data_root}")
 
-    train_records = load_split_records(args.data_root, "train", args.lm_margin)
-    val_records = load_split_records(args.data_root, "test", args.lm_margin)
+    train_records = load_split_records(args.data_root, "train", cfg.lm_margin)
+    val_records = load_split_records(args.data_root, "test", cfg.lm_margin)
     if not train_records or not val_records:
         raise RuntimeError("Empty train or val records.")
 
-    train_ds = build_tf_dataset(
-        train_records, img_size=args.img_size, crop_margin=args.crop_margin,
-        batch_size=args.batch_size, training=True, seed=args.seed,
-    )
-    val_ds = build_tf_dataset(
-        val_records, img_size=args.img_size, crop_margin=args.crop_margin,
-        batch_size=args.batch_size, training=False, seed=args.seed,
-    )
+    train_ds = build_tf_dataset(train_records, cfg=cfg, training=True)
+    val_ds = build_tf_dataset(val_records, cfg=cfg, training=False)
 
-    model = build_model(img_size=args.img_size, pretrained=not args.no_pretrained)
+    model = build_model(cfg)
     model.summary()
 
     if not args.tflite_only:
-        model = train_model(model, train_ds, val_ds, out_dir=args.out_dir, args=args,
+        model = train_model(model, train_ds, val_ds, out_dir=args.out_dir, cfg=cfg,
                             num_train=len(train_records))
     else:
         best_w = args.out_dir / "best.weights.h5"
@@ -735,26 +1438,25 @@ def main() -> None:
             raise FileNotFoundError(f"--tflite-only: {best_w} not found")
         model.load_weights(str(best_w))
 
-    compile_model(model, lr=args.finetune_learning_rate)
+    compile_model(model, lr=cfg.learning_rate, cfg=cfg)
     val_metrics = evaluate_model(model, val_ds)
 
-    tflite_path = args.out_dir / f"dog_face_landmarks_{args.img_size}_float16.tflite"
+    tflite_path = args.out_dir / f"dog_face_landmarks_{cfg.img_size}_float16.tflite"
     export_tflite(model, tflite_path)
 
     tflite_sanity = tflite_sanity_check(
         tflite_path, val_records,
-        img_size=args.img_size, crop_margin=args.crop_margin,
+        img_size=cfg.img_size, crop_margin=cfg.crop_margin,
     )
     save_metadata(
         out_dir=args.out_dir,
-        img_size=args.img_size,
-        crop_margin=args.crop_margin,
+        cfg=cfg,
+        data_root=args.data_root,
         train_records=train_records,
         val_records=val_records,
         val_metrics=val_metrics,
         tflite_path=tflite_path,
         tflite_sanity=tflite_sanity,
-        args=args,
     )
 
     print("\nDone.")
