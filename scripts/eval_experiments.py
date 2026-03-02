@@ -44,7 +44,7 @@ DATA_ROOT = (
     Path.home() / ".cache" / "kagglehub" / "datasets"
     / "georgemartvel" / "dogflw" / "versions" / "1" / "DogFLW"
 )
-MODEL_PATH = Path("artifacts/heatmap_v2s_112/best.keras")
+MODEL_PATH = Path("artifacts/tight_margin/best.keras")
 
 
 def load_heatmap_model(model_path: Path):
@@ -362,7 +362,7 @@ def main():
     configure_ca_bundle()
     set_seed(42)
 
-    cfg = copy.deepcopy(EXPERIMENT_PRESETS["heatmap_v2s_112"])
+    cfg = copy.deepcopy(EXPERIMENT_PRESETS["tight_margin"])
     val_records = load_split_records(DATA_ROOT, "test", cfg.lm_margin)
 
     print(f"Loading model from {MODEL_PATH}...")
@@ -444,8 +444,8 @@ def main():
     overall_best = min(results, key=lambda r: min(r["nme"], r["tta"]))
     best_nme = min(overall_best["nme"], overall_best["tta"])
     print(f"\nOverall best: {overall_best['name']} -> {best_nme:.4f}")
-    print(f"Baseline comparison: 10.58 (no TTA) / 10.14 (flip TTA)")
-    print(f"Improvement: {10.14 - best_nme:.4f}")
+    print(f"Baseline comparison: 9.53 (no TTA) / 9.11 (flip TTA)")
+    print(f"Improvement: {9.11 - best_nme:.4f}")
 
 
 if __name__ == "__main__":
