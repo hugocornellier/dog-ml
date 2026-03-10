@@ -57,7 +57,7 @@ class ExperimentConfig:
     name: str = "default"
 
     # Architecture
-    backbone: str = "efficientnetb2"  # "efficientnetb2" or "efficientnetv2s"
+    backbone: str = "efficientnetb2"  # "efficientnetb2", "efficientnetv2s", or "densenet121"
     head_type: str = "dense"          # "dense" (GAP+FC) or "heatmap" (deconv+soft-argmax)
     heatmap_channels: int = 256       # intermediate channels in deconv head
     heatmap_dropout: float = 0.0      # SpatialDropout2D rate in deconv head
@@ -125,7 +125,8 @@ class ExperimentConfig:
     pure_heatmap_supervision: bool = False  # True = heatmap MSE only, no coord loss
     heatmap_sigma: float = 1.75       # Gaussian sigma in heatmap pixels
     coord_loss_weight: float = 0.25   # weight for coord MSE in hybrid mode
-    num_deconv_layers: int = 3        # 3 -> 56x56, 4 -> 112x112
+    num_deconv_layers: int = 3        # 2 -> 28x28, 3 -> 56x56, 4 -> 112x112
+    per_landmark_heatmap_loss: bool = False  # normalize heatmap MSE per-landmark (fixes background domination)
 
     # SoftArgmax2D temperature
     softargmax_beta: float = 1.0      # temperature parameter (higher = sharper)
@@ -1047,6 +1048,208 @@ EXPERIMENT_PRESETS: dict[str, ExperimentConfig] = {
         nme_mode="iod",
         patience=50,
     ),
+    # --- 384x384 resolution (resolution keeps giving returns) ---
+    "tight_margin_384": ExperimentConfig(
+        name="tight_margin_384",
+        backbone="efficientnetv2s",
+        head_type="heatmap",
+        heatmap_dropout=0.1,
+        num_deconv_layers=4,
+        epochs=100,
+        finetune_epochs=200,
+        finetune_learning_rate=1e-5,
+        finetune_last_layers=50,
+        batch_size=8,  # try 8 at 384px (was 4, too slow)
+        learning_rate=1e-4,
+        lr_schedule="constant",
+        loss="mse",
+        optimizer="adamw",
+        weight_decay=1e-4,
+        use_swa=False,
+        img_size=384,
+        lm_margin=0.05,
+        crop_margin=0.10,
+        aug_rotation=True,
+        aug_rotation_deg=15.0,
+        aug_flip=True,
+        aug_crop_jitter=True,
+        aug_crop_jitter_frac=0.08,
+        aug_scale=True,
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        nme_mode="iod",
+        patience=50,
+    ),
+    # --- DenseNet121 + low-res heatmap supervision (replicates paper's 6.70) ---
+    # Key insight: heatmap supervision works at LOW resolution (28-56px),
+    # not HIGH resolution (112-160px). At 56x56, sigma=2 covers ~0.4% of
+    # pixels, comparable to human pose estimation where this approach succeeds.
+    # Per-landmark normalization prevents background domination.
+    "densenet121_heatmap_56": ExperimentConfig(
+        name="densenet121_heatmap_56",
+        backbone="densenet121",
+        head_type="heatmap",
+        heatmap_dropout=0.1,
+        num_deconv_layers=3,  # 7x7 -> 56x56 heatmaps
+        epochs=100,
+        finetune_epochs=200,
+        finetune_learning_rate=1e-5,
+        finetune_last_layers=50,
+        batch_size=16,
+        learning_rate=1e-4,
+        lr_schedule="constant",
+        loss="mse",
+        optimizer="adamw",
+        weight_decay=1e-4,
+        use_swa=False,
+        img_size=224,
+        lm_margin=0.05,
+        crop_margin=0.10,
+        pure_heatmap_supervision=True,
+        per_landmark_heatmap_loss=True,
+        heatmap_sigma=2.0,
+        softargmax_beta=10.0,
+        aug_rotation=True,
+        aug_rotation_deg=15.0,
+        aug_flip=True,
+        aug_crop_jitter=True,
+        aug_crop_jitter_frac=0.08,
+        aug_scale=True,
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        nme_mode="iod",
+        patience=50,
+    ),
+    # --- DenseNet121 heatmap at 320px (higher res if 224 works) ---
+    "densenet121_heatmap_320": ExperimentConfig(
+        name="densenet121_heatmap_320",
+        backbone="densenet121",
+        head_type="heatmap",
+        heatmap_dropout=0.1,
+        num_deconv_layers=3,  # 10x10 -> 80x80 heatmaps at 320px
+        epochs=100,
+        finetune_epochs=200,
+        finetune_learning_rate=1e-5,
+        finetune_last_layers=50,
+        batch_size=8,
+        learning_rate=1e-4,
+        lr_schedule="constant",
+        loss="mse",
+        optimizer="adamw",
+        weight_decay=1e-4,
+        use_swa=False,
+        img_size=320,
+        lm_margin=0.05,
+        crop_margin=0.10,
+        pure_heatmap_supervision=True,
+        per_landmark_heatmap_loss=True,
+        heatmap_sigma=2.5,
+        softargmax_beta=10.0,
+        aug_rotation=True,
+        aug_rotation_deg=15.0,
+        aug_flip=True,
+        aug_crop_jitter=True,
+        aug_crop_jitter_frac=0.08,
+        aug_scale=True,
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        nme_mode="iod",
+        patience=50,
+    ),
+    # --- EfficientNetV2S + per-landmark heatmap at 56x56 (test heatmap loss fix alone) ---
+    "v2s_heatmap_56_perlm": ExperimentConfig(
+        name="v2s_heatmap_56_perlm",
+        backbone="efficientnetv2s",
+        head_type="heatmap",
+        heatmap_dropout=0.1,
+        num_deconv_layers=3,  # 56x56 heatmaps
+        epochs=100,
+        finetune_epochs=200,
+        finetune_learning_rate=1e-5,
+        finetune_last_layers=50,
+        batch_size=16,
+        learning_rate=1e-4,
+        lr_schedule="constant",
+        loss="mse",
+        optimizer="adamw",
+        weight_decay=1e-4,
+        use_swa=False,
+        img_size=224,
+        lm_margin=0.05,
+        crop_margin=0.10,
+        pure_heatmap_supervision=True,
+        per_landmark_heatmap_loss=True,
+        heatmap_sigma=2.0,
+        softargmax_beta=10.0,
+        aug_rotation=True,
+        aug_rotation_deg=15.0,
+        aug_flip=True,
+        aug_crop_jitter=True,
+        aug_crop_jitter_frac=0.08,
+        aug_scale=True,
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        nme_mode="iod",
+        patience=50,
+    ),
+    # --- 320px + cosine annealing + 300 epoch Phase 2 ---
+    "tight_margin_320_cosine": ExperimentConfig(
+        name="tight_margin_320_cosine",
+        backbone="efficientnetv2s",
+        head_type="heatmap",
+        heatmap_dropout=0.1,
+        num_deconv_layers=4,
+        epochs=100,
+        finetune_epochs=300,
+        finetune_learning_rate=1e-5,
+        finetune_last_layers=50,
+        batch_size=8,
+        learning_rate=1e-4,
+        lr_schedule="cosine",
+        lr_min=1e-7,
+        loss="mse",
+        optimizer="adamw",
+        weight_decay=1e-4,
+        use_swa=False,
+        img_size=320,
+        lm_margin=0.05,
+        crop_margin=0.10,
+        aug_rotation=True,
+        aug_rotation_deg=15.0,
+        aug_flip=True,
+        aug_crop_jitter=True,
+        aug_crop_jitter_frac=0.08,
+        aug_scale=True,
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        nme_mode="iod",
+        patience=50,
+    ),
     # --- 256x256 + longer fine-tuning (300 epochs Phase 2) ---
     "tight_margin_256_long": ExperimentConfig(
         name="tight_margin_256_long",
@@ -1248,7 +1451,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use-swa", action="store_true", default=None)
     p.add_argument("--no-swa", dest="use_swa", action="store_false")
     p.add_argument("--nme-mode", choices=["crop", "iod"], default=None)
-    p.add_argument("--backbone", choices=["efficientnetb2", "efficientnetv2s"], default=None)
+    p.add_argument("--backbone", choices=["efficientnetb2", "efficientnetv2s", "densenet121"], default=None)
     p.add_argument("--head-type", choices=["dense", "heatmap"], default=None)
     p.add_argument("--unfreeze-backbone", action="store_true", default=None)
     p.add_argument("--no-unfreeze-backbone", dest="unfreeze_backbone", action="store_false")
@@ -2001,16 +2204,30 @@ def build_model(cfg: ExperimentConfig) -> tf.keras.Model:
     img_size = cfg.img_size
     pretrained = not cfg.no_pretrained
     inputs = tf.keras.Input(shape=(img_size, img_size, 3), name="crop")
-    # EfficientNet expects [0, 255] input.
-    x = tf.keras.layers.Rescaling(scale=255.0, offset=0.0, name="to_0_255")(inputs)
 
-    if cfg.backbone == "efficientnetv2s":
+    if cfg.backbone == "densenet121":
+        # DenseNet121 uses torch-style preprocessing: normalize [0,1] input
+        # with ImageNet mean=[0.485,0.456,0.406] and std=[0.229,0.224,0.225]
+        x = tf.keras.layers.Normalization(
+            mean=[0.485, 0.456, 0.406],
+            variance=[0.229**2, 0.224**2, 0.225**2],
+            name="imagenet_norm",
+        )(inputs)
+        backbone = tf.keras.applications.DenseNet121(
+            input_shape=(img_size, img_size, 3),
+            include_top=False,
+            weights=None if not pretrained else "imagenet",
+        )
+    elif cfg.backbone == "efficientnetv2s":
+        # EfficientNetV2S includes internal Rescaling; expects [0, 255] input.
+        x = tf.keras.layers.Rescaling(scale=255.0, offset=0.0, name="to_0_255")(inputs)
         backbone = tf.keras.applications.EfficientNetV2S(
             input_shape=(img_size, img_size, 3),
             include_top=False,
             weights=None if not pretrained else "imagenet",
         )
     else:  # efficientnetb2
+        x = tf.keras.layers.Rescaling(scale=255.0, offset=0.0, name="to_0_255")(inputs)
         backbone = tf.keras.applications.EfficientNetB2(
             input_shape=(img_size, img_size, 3),
             include_top=False,
@@ -2110,9 +2327,24 @@ def compile_model(model: tf.keras.Model, lr, cfg: ExperimentConfig) -> None:
 
     if cfg.pure_heatmap_supervision:
         # Pure heatmap supervision: only heatmap MSE loss, no coord metrics during training.
+        if cfg.per_landmark_heatmap_loss:
+            # Per-landmark normalized MSE: average loss within each landmark channel,
+            # then average across landmarks. This prevents background pixels from
+            # dominating the loss gradient — each landmark contributes equally regardless
+            # of how many background pixels exist.
+            @tf.keras.utils.register_keras_serializable(package="DogFLW")
+            def per_landmark_heatmap_mse(y_true, y_pred):
+                # y_true, y_pred: (B, H, W, K) where K=46 landmarks
+                sq_diff = tf.square(y_true - y_pred)  # (B, H, W, K)
+                # Average over spatial dims per landmark, then average across landmarks
+                per_lm = tf.reduce_mean(sq_diff, axis=[1, 2])  # (B, K)
+                return tf.reduce_mean(per_lm)
+            hm_loss = per_landmark_heatmap_mse
+        else:
+            hm_loss = tf.keras.losses.MeanSquaredError()
         model.compile(
             optimizer=optimizer,
-            loss=tf.keras.losses.MeanSquaredError(),
+            loss=hm_loss,
             run_eagerly=False,
         )
     elif cfg.heatmap_supervision:
@@ -2134,9 +2366,11 @@ def compile_model(model: tf.keras.Model, lr, cfg: ExperimentConfig) -> None:
 
 def get_backbone(model: tf.keras.Model) -> tf.keras.Model:
     for layer in model.layers:
-        if isinstance(layer, tf.keras.Model) and layer.name.startswith("efficientnet"):
+        if isinstance(layer, tf.keras.Model) and (
+            layer.name.startswith("efficientnet") or layer.name.startswith("densenet")
+        ):
             return layer
-    raise RuntimeError("EfficientNet backbone not found")
+    raise RuntimeError("Backbone not found")
 
 
 @tf.keras.utils.register_keras_serializable(package="DogFLW")
@@ -2311,7 +2545,17 @@ def train_model(
         # Use warmup for backbone fine-tuning to avoid destroying pretrained weights.
         steps_per_epoch = math.ceil(num_train / cfg.batch_size)
         warmup_steps = steps_per_epoch * 5  # 5-epoch warmup for Phase 2
-        ft_lr = WarmupSchedule(cfg.finetune_learning_rate, warmup_steps)
+        if cfg.lr_schedule == "cosine":
+            # Cosine decay for Phase 2 fine-tuning
+            total_ft_steps = steps_per_epoch * cfg.finetune_epochs
+            cosine_sched = tf.keras.optimizers.schedules.CosineDecay(
+                initial_learning_rate=cfg.finetune_learning_rate,
+                decay_steps=total_ft_steps,
+                alpha=cfg.lr_min,
+            )
+            ft_lr = WarmupSchedule(cosine_sched, warmup_steps)
+        else:
+            ft_lr = WarmupSchedule(cfg.finetune_learning_rate, warmup_steps)
         compile_model(model, lr=ft_lr, cfg=cfg)
 
         swa_cb = SWACallback(start_epoch=cfg.finetune_epochs // 2) if cfg.use_swa else None

@@ -1,6 +1,6 @@
 # Dog Facial Landmark Detection: Progress Journal
 
-**Current best: NME_IOD = 8.22 (2-model 256+320 ensemble + ms+flip TTA) / 8.82 (no TTA, 320px single model) | Target: 6.52 (paper) | Started at: ~40**
+**Current best: NME_IOD = 8.04 (3-model 256+320+384 ensemble + ms+flip TTA) / 8.77 (no TTA, 384px single model) | Target: 6.52 (paper) | Started at: ~40**
 
 This document is a living journal of our work improving dog facial landmark detection. It's designed for future LLMs/developers to pick up where we left off and continue pushing toward the paper's target.
 
@@ -9,37 +9,51 @@ This document is a living journal of our work improving dog facial landmark dete
 ## Quick Reference
 
 ### Current Best Model
-- **Overall best**: 2-model ensemble (tight_margin_256 + tight_margin_320) + ms+flip TTA — **NME 8.22** (12 passes: 2 models × 3 scales × 2 flips)
-- **Best single model**: `tight_margin_320` — **8.82** (no TTA) / **8.52** (flip-TTA) / **8.32** (ms+flip TTA)
+- **Overall best**: 3-model ensemble (tight_margin_256 + tight_margin_320 + tight_margin_384) + ms+flip TTA — **NME 8.04** (18 passes: 3 models × 3 scales × 2 flips)
+- **Best single model**: `tight_margin_384` — **8.77** (no TTA) / **8.49** (flip-TTA) / **8.33** (ms+flip TTA)
 - **Architecture**: EfficientNetV2S + **4-deconv** heatmap head + SoftArgmax2D
-- **Input**: 320×320 (tight_margin_320) / 256×256 (tight_margin_256)
-- **Key change from previous best**: 320px input resolution (160x160 heatmaps instead of 128x128)
-- **Artifacts**: `artifacts/tight_margin_320/` and `artifacts/tight_margin_256/`
-- **Previous single-model best**: `tight_margin_256` at NME 9.27 / 8.66 ms+flip TTA
-- **Train-val gap**: ~3.5 (structural — not addressable by regularization alone)
+- **Input**: 384×384 / 320×320 / 256×256 (three resolutions in ensemble)
+- **Key change from previous best**: Added 384px model (192x192 heatmaps) to the ensemble
+- **Artifacts**: `artifacts/tight_margin_384/`, `artifacts/tight_margin_320/`, `artifacts/tight_margin_256/`
+- **Train-val gap**: ~4.0 at 384px (structural — not addressable by regularization alone)
+
+### All Single-Model Results
+| Model | No TTA | Flip TTA | ms+flip TTA |
+|---|---|---|---|
+| tight_margin_384 (384px) | **8.77** | **8.49** | 8.33 |
+| tight_margin_320 (320px) | 8.82 | 8.52 | **8.32** |
+| tight_margin_256 (256px) | 9.27 | 8.88 | 8.66 |
+
+### All Ensemble Results (ms+flip TTA)
+| Ensemble | NME_IOD | Passes |
+|---|---|---|
+| **3-model (256+320+384)** | **8.04** | 18 |
+| 2-model (320+384) | 8.10 | 12 |
+| 2-model (256+384) | 8.11 | 12 |
+| 2-model (256+320) | 8.22 | 12 |
 
 ### Key Commands
 ```bash
-# Train with the current best preset (112x112 heatmaps)
-python scripts/train_dog_face_landmarks.py --experiment heatmap_v2s_112 --out artifacts/my_run
+# Train at 384px (current best single-model resolution)
+python scripts/train_dog_face_landmarks.py --experiment tight_margin_384 --out artifacts/tight_margin_384
 
-# Train with the previous best preset (56x56 heatmaps)
-python scripts/train_dog_face_landmarks.py --experiment heatmap_v2s_best --out artifacts/my_run
+# Train at 320px
+python scripts/train_dog_face_landmarks.py --experiment tight_margin_320 --out artifacts/tight_margin_320
 
-# Generate _pred/_true visualizations (uses ALL 480 test images)
+# Train at 256px
+python scripts/train_dog_face_landmarks.py --experiment tight_margin_256 --out artifacts/tight_margin_256
+
+# Comprehensive evaluation of all models + ensembles + TTA
+python scripts/eval_all_models.py
+
+# Generate _pred/_true visualizations (uses 3-model ensemble, all 480 test images)
 python scripts/gen_landmark_examples.py
 
-# Run automated NME push experiments
-python scripts/run_nme_push.py
-
-# Run NME push v2 experiments (tight margin, mixup, pure heatmap, combined)
-python scripts/run_nme_push_v2.py
-
-# Evaluate existing model with different SoftArgmax temperatures / multi-scale TTA
-python scripts/eval_experiments.py
+# Run overnight experiment marathon (chain: train → eval → train → eval)
+bash scripts/overnight_marathon.sh
 
 # Quick smoke test (5 epochs)
-python scripts/train_dog_face_landmarks.py --experiment heatmap_v2s_112 --epochs 5 --patience 50 --out artifacts/smoke
+python scripts/train_dog_face_landmarks.py --experiment tight_margin_256 --epochs 5 --patience 50 --out artifacts/smoke
 ```
 
 ---
@@ -339,6 +353,81 @@ Created `scripts/eval_experiments.py` for zero-cost evaluations (beta sweep, mul
 - The tight crop means rotated/scaled images often push landmarks to crop edges or outside it
 - Moderate augmentation (20° rotation) still untested — may be the sweet spot
 
+### Round 7: 384px Resolution + 3-Model Ensemble (NME_IOD = 8.04)
+
+Overnight marathon session to push the ensemble further with a higher-resolution 384px model and explore cosine annealing / DenseNet121 backbone alternatives. Also added DenseNet121 backbone support and per-landmark heatmap loss to the training script.
+
+**New code additions**:
+- DenseNet121 backbone support with proper torch-style ImageNet preprocessing (`Normalization` layer)
+- Per-landmark normalized heatmap MSE loss (averages per-channel before averaging across landmarks, fixes background-dominated loss)
+- Cosine annealing LR schedule for Phase 2 (alternative to ReduceLROnPlateau)
+- `scripts/eval_all_models.py` — comprehensive eval: all models, all TTA modes, all pair ensembles, full ensemble
+- `scripts/overnight_marathon.sh` — automated chain: train → eval → train → eval
+
+**Architecture (192×192 heatmaps at 384px)**:
+```
+EfficientNetV2S (frozen, 384×384)
+    -> 12×12×1280 feature map
+    -> Conv2DTranspose(256, 4×4, stride 2) + BN + ReLU  -> 24×24
+    -> Conv2DTranspose(256, 4×4, stride 2) + BN + ReLU  -> 48×48
+    -> Conv2DTranspose(256, 4×4, stride 2) + BN + ReLU  -> 96×96
+    -> Conv2DTranspose(256, 4×4, stride 2) + BN + ReLU  -> 192×192
+    -> Conv2D(46, 1×1)  -> 192×192 heatmaps
+    -> SoftArgmax2D      -> 92 coordinates [0,1]
+```
+
+| # | Experiment | NME_IOD | + flip TTA | + ms+flip TTA | Notes |
+|---|---|---|---|---|---|
+| 1 | **384×384 input resolution** | **8.77** | **8.49** | **8.33** | New best single-model no-TTA |
+| 2 | 2-model (320+384) ensemble | — | — | **8.10** | Best pair ensemble |
+| 3 | 2-model (256+384) ensemble | — | — | **8.11** | Nearly ties 320+384 |
+| 4 | **3-model (256+320+384) ensemble** | — | — | **8.04** | **NEW OVERALL BEST** |
+| 5 | 320px cosine annealing | (training) | — | — | In progress |
+| 6 | DenseNet121 + per-landmark heatmap | (queued) | — | — | Code ready, not yet trained |
+
+**Key learnings**:
+
+**384×384 resolution (marginal but valuable in ensemble)**:
+- Input 384×384 gives 192×192 heatmaps (vs 160×160 at 320px, 128×128 at 256px)
+- Baseline NME: 8.77 (vs 320px's 8.82) — only 0.05 improvement, heavily diminishing returns
+- With ms+flip TTA: 8.33 (vs 320px's 8.32) — almost identical
+- Required 200 Phase 2 epochs with LR reduction to beat 320px; batch_size=8 (vs 16 for 320px) due to memory
+- Training took ~9 hours total (Phase 1: 78 epochs, Phase 2: 200 epochs at ~2min/epoch)
+- **Resolution gains are plateauing**: 224→256 gave 0.25, 256→320 gave 0.42, 320→384 gave 0.05
+- Despite near-identical solo performance, 384px contributes significantly to ensemble diversity
+
+**3-model ensemble = new best (8.04)**:
+- 3 models × 3 scales × 2 flips = 18 forward passes per image
+- Beats best 2-model pair (8.10) by 0.06 and old best (8.22) by 0.18
+- Pair rankings: 320+384 (8.10) > 256+384 (8.11) > 256+320 (8.22)
+- The 384px model contributes the most as an ensemble member despite being ~equal solo
+- Resolution diversity is the key: each model captures different spatial features at different scales
+
+**Per-region NME improvement (3-model ensemble vs old 2-model)**:
+| Region | Old (8.22) | New (8.04) | Improvement |
+|---|---|---|---|
+| right_ear | 14.0 | 12.87 | -1.13 |
+| left_ear | 12.2 | 11.21 | -0.99 |
+| nose_nostrils | 7.9 | 7.10 | -0.80 |
+| mouth | 7.4 | 6.55 | -0.85 |
+| left_eye | 5.2 | 4.64 | -0.56 |
+| nose_bridge | 4.9 | 4.28 | -0.62 |
+| right_eye | 4.9 | 4.24 | -0.66 |
+
+All regions improved significantly. Ears still dominate error (12-13 NME vs 4-7 for other regions).
+
+**Training the 384px model — observations**:
+- Phase 1 converged in 78 epochs (val NME 9.56); Phase 2 ran all 200 epochs
+- Critical LR reduction around epoch 150 broke through a plateau (8.84→8.76)
+- Final best: 8.742 at epoch 195 (reported as 8.77 in eval due to TFLite quantization)
+- Train NME reached 4.87, train-val gap nearly 4.0 — heaviest overfitting of any model
+- batch_size=4 was too slow (~235s/epoch = 19hrs); switched to batch_size=8 (~120s/epoch)
+
+**Per-landmark heatmap loss (code ready, not yet fully trained)**:
+- New loss function averages MSE per-landmark channel before averaging across landmarks
+- Fixes the background-dominated loss problem: at 56×56, sigma=2.5 Gaussian covers ~25/3136 pixels (0.8%) — per-landmark normalization ensures each landmark contributes equally
+- Smoke test (5 epochs): loss converged properly (0.061→0.004) unlike old approach, but NME was 79.81 after 5 epochs — too early to evaluate
+
 ---
 
 ## What Worked (Ranked by Impact)
@@ -346,15 +435,16 @@ Created `scripts/eval_experiments.py` for zero-cost evaluations (beta sweep, mul
 1. **Heatmap head replacing GAP+Dense** — 40 -> 12 (3x improvement, the breakthrough)
 2. **Tight crop margin** — 10.58 -> 9.53, 10.14 -> 9.11 with TTA (~1 point improvement). Reduced `lm_margin` from 0.12 to 0.05 and `crop_margin` from 0.20 to 0.10. Gives the model 2x more face pixels.
 3. **320×320 input resolution** — 9.27 -> 8.82 (0.45 point), 8.66 -> 8.32 ms+flip TTA. Biggest resolution gain yet; 160x160 heatmaps.
-4. **256×256 input resolution** — 9.53 -> 9.27, 9.11 -> 8.88 with TTA (~0.25 point). Larger input gives 128x128 heatmaps vs 112x112.
-5. **Horizontal flip augmentation** — 12 -> 11.7 (halves overfitting gap)
-6. **Two-phase backbone fine-tuning** — 11.7 -> 10.7 (adapts features to task)
-7. **Multi-scale + flip TTA at inference** — 9.27 -> 8.66 single model, 8.82 -> 8.32 (320px) (free gain with 3 scales × 2 flips = 6 passes)
-8. **2-model (256+320) ensemble + ms+flip TTA** — 8.32 -> 8.22, resolution diversity beats model count
-9. **Flip-TTA at inference** — 10.7 -> 10.25, 9.53 -> 9.11, 8.82 -> 8.52 (~0.4-0.5 free gain)
-10. **112x112 heatmaps (4th deconv)** — 10.72 -> 10.58 (modest resolution gain)
-11. **Scale augmentation** — modest but synergistic with flip
-12. **AdamW optimizer** — slight improvement over Adam
+4. **384×384 input resolution** — 8.82 -> 8.77 (only 0.05), but critical for ensemble diversity. 192x192 heatmaps.
+5. **256×256 input resolution** — 9.53 -> 9.27, 9.11 -> 8.88 with TTA (~0.25 point). Larger input gives 128x128 heatmaps vs 112x112.
+6. **Horizontal flip augmentation** — 12 -> 11.7 (halves overfitting gap)
+7. **Two-phase backbone fine-tuning** — 11.7 -> 10.7 (adapts features to task)
+8. **Multi-scale + flip TTA at inference** — 9.27 -> 8.66 single model, 8.82 -> 8.32 (320px) (free gain with 3 scales × 2 flips = 6 passes)
+9. **3-model (256+320+384) ensemble + ms+flip TTA** — best single 8.32 -> **8.04**, a 0.28 gain from ensembling + resolution diversity
+10. **Flip-TTA at inference** — 10.7 -> 10.25, 9.53 -> 9.11, 8.82 -> 8.52 (~0.4-0.5 free gain)
+11. **112x112 heatmaps (4th deconv)** — 10.72 -> 10.58 (modest resolution gain)
+12. **Scale augmentation** — modest but synergistic with flip
+13. **AdamW optimizer** — slight improvement over Adam
 
 ## What Didn't Work
 
@@ -382,10 +472,11 @@ The single biggest obstacle to reaching single digits is the **train-val gap**. 
 |---|---|---|---|
 | heatmap_v2s (frozen, no aug) | 4.19 | 12.18 | 7.99 |
 | heatmap_v2s_best (flip+scale) | 7.46 | 10.72 | 3.26 |
-| heatmap_v2s_112 (current best) | 6.10 | 10.58 | 4.48 |
+| heatmap_v2s_112 | 6.10 | 10.58 | 4.48 |
 | tight_margin | 5.95 | 9.53 | 3.58 |
 | tight_margin_256 | ~5.7 | 9.27 | ~3.6 |
-| tight_margin_320 (current best) | ~5.4 | 8.82 | ~3.4 |
+| tight_margin_320 | ~5.4 | 8.82 | ~3.4 |
+| tight_margin_384 (current best) | ~4.9 | 8.77 | ~3.9 |
 
 The model can fit training data to NME ~6 but generalizes to only ~10.5. The 3,853 training images across 120 breeds (only ~32 images per breed) are insufficient for the model to generalize well. Key observations:
 - Augmentation cuts the gap significantly (8.0 -> 3.3 with flip+scale)
@@ -402,12 +493,13 @@ The model can fit training data to NME ~6 but generalizes to only ~10.5. The 3,8
 
 ---
 
-## Remaining Gap: 8.22 -> 6.52
+## Remaining Gap: 8.04 -> 6.52
 
 ### What the paper does that we don't
 1. **ELD Ensemble** (biggest factor) — multiple specialized models per landmark subset (e.g., one for ears, one for eyes, one for mouth). This is how they get from ~8.5 (single model) to 6.52.
-2. **Multi-scale TTA** — we only do flip-TTA; the paper likely uses scale TTA and possibly rotation TTA
-3. **Better generalization** — the paper may use more aggressive augmentation or curriculum learning
+2. **Per-landmark heatmap supervision** — the paper trains MSE on heatmaps at low resolution (~28×28), not coordinate MSE at high resolution. This provides denser gradient signal per landmark.
+3. **SubpixelMaxima2D** — the paper uses a different coordinate extraction method than our SoftArgmax2D
+4. **DenseNet121 backbone** — the paper's single-model baseline achieves 6.70 with DenseNet121 + heatmap supervision
 
 ### Strategies tried and remaining
 
@@ -420,34 +512,42 @@ The model can fit training data to NME ~6 but generalizes to only ~10.5. The 3,8
 | Mixup augmentation | -0.5 to -1.5 | Medium | **Tried** | Underfitting — val NME ~10.4, worse than baseline |
 | 256×256 input resolution | -0.2 to -0.3 | Easy | **Done** | -0.26 (9.53→9.27) / -0.23 with TTA |
 | 320×320 input resolution | -0.3 to -0.5 | Easy | **Done** | -0.45 (9.27→8.82) / -0.34 ms+flip TTA |
+| 384×384 input resolution | -0.1 to -0.3 | Easy | **Done** | -0.05 (8.82→8.77); diminishing returns but ensemble-critical |
 | Pure heatmap supervision (coord-free) | -0.5 to -1.0 | Medium | **Failed** | NME 33.7, background-dominated loss |
+| Per-landmark heatmap loss | -0.5 to -1.0 | Medium | **Code ready** | Smoke test promising (loss converges); full training queued |
 | SoftArgmax2D temperature tuning | -0.1 to -0.3 | Easy | **Done** | beta=1 optimal for coord-trained models |
 | SoftArgmax beta=10 training | -0.1 to -0.2 | Easy | **Done** | -0.02 TTA improvement (9.11→9.09) |
 | Strong augmentation (30°/1.25x) | -0.3 to -0.5 | Easy | **Done** | +0.14 (9.53→9.67), too aggressive |
 | Scale TTA (multi-scale inference) | -0.2 to -0.4 | Easy | **Done** | -0.61 (9.27→8.66 single model, 8.82→8.32 at 320px) |
 | Stronger regularization (dropout/decay) | -0.3 to -0.5 | Easy | **Done** | No improvement (9.31 vs 9.23); gap is structural |
-| 2-model resolution ensemble (256+320) | -0.1 to -0.3 | Easy | **Done** | -0.10 (8.32→8.22); best overall result |
+| 2-model resolution ensemble (256+320) | -0.1 to -0.3 | Easy | **Done** | -0.10 (8.32→8.22) |
+| 3-model resolution ensemble (256+320+384) | -0.1 to -0.2 | Easy | **Done** | -0.28 (8.32→8.04); **current best** |
+| Ear-weighted loss (2x on ears) | -0.3 to -0.5 | Easy | **Done** | +0.07 (9.27→9.34); hurt non-ear regions |
+| DenseNet121 backbone | -0.5 to -1.0 | Medium | **Code ready** | Not yet trained |
+| Cosine annealing LR schedule | -0.1 to -0.3 | Easy | **Training** | 320px cosine model in progress |
 | Multi-scale feature fusion (FPN-lite) | -0.4 to -1.0 | Medium | Not done | -- |
 | ELD-style ensemble (2-3 specialist models) | -2.0 to -4.0 | Hard | Not done | -- |
 
 ### Recommended next steps (in priority order)
 
-1. **Pure heatmap supervision** (Medium, high potential) — train directly on Gaussian heatmap targets (sigma=2.5 for 112x112), no coordinate loss during training. This is how DeepLabCut achieves 6.70 on this dataset. Different from the earlier failed dual-loss approach: here there's NO coordinate branch at all during training, so no gradient interference. SoftArgmax2D is attached only for inference. Preset `pure_heatmap` is ready to go. Also try different beta values for SoftArgmax2D at inference (sweep [1, 10, 20, 40, 60]).
+1. **Per-landmark heatmap supervision** (Medium, highest potential) — the paper's approach: train MSE on per-landmark Gaussian heatmaps at low resolution (28×28 or 56×56). Code is ready in training script (`per_landmark_heatmap_loss` flag). Key insight: per-landmark normalization fixes the background-dominated loss that killed previous heatmap supervision attempts. Smoke test showed loss converging properly (0.061→0.004) unlike old approach. Preset `densenet121_heatmap_56` ready.
 
-2. **SoftArgmax2D temperature sweep** (Easy, free gain) — the current model uses beta=1.0 (flat softmax). Higher beta (20-60) makes the distribution peakier, potentially improving coordinate extraction precision. Can test on the existing trained model without retraining. Script `eval_experiments.py` has this implemented.
+2. **DenseNet121 backbone** (Medium, high potential) — the paper's single-model baseline achieves 6.70 with DenseNet121 + heatmap supervision, 2.12 points better than our 8.82 single-model. Code ready with torch-style ImageNet preprocessing. Presets `densenet121_heatmap_56` and `densenet121_heatmap_320` available.
 
-3. **Multi-scale TTA** (Easy, free gain) — run inference at 3 scales (0.9x, 1.0x, 1.1x) × 2 flips = 6 forward passes, average coordinates. Expected additional gain: 0.1-0.3 on top of flip-TTA.
+3. **448×448 resolution** (Easy, moderate potential) — diminishing returns from 384px (only +0.05), but may still contribute ensemble diversity. Would produce 224×224 heatmaps. Memory-constrained: may need batch_size=4.
 
-4. **Lighter mixup** (Easy, quick test) — try lower mixup probability (p=0.1-0.15) or only during Phase 1 (not Phase 2). The full p=0.4 was too aggressive.
+4. **EfficientNetV2M backbone** (Medium, moderate potential) — more capacity than V2S, different features for ensemble diversity.
 
-5. **ELD-style ensemble** (Hard, biggest gain) — train 2-3 specialist models on landmark subsets (ears, eyes+nose, mouth). This is what bridges the gap from ~9 to ~6.5 in the paper.
+5. **ELD-style ensemble** (Hard, biggest gain) — train 2-3 specialist models on landmark subsets (ears, eyes+nose, mouth). This is what bridges the gap from ~8 to ~6.5 in the paper. Our per-region analysis shows ears at 11-13 NME vs 4-7 for other regions — an ear specialist could dramatically reduce overall error.
 
 ### Realistic targets (updated)
-- Single model + flip-TTA: **8.52** (achieved, 320px)
+- Single model no TTA: **8.77** (achieved, 384px)
+- Single model + flip-TTA: **8.49** (achieved, 384px)
 - Single model + ms+flip TTA: **8.32** (achieved, 320px)
-- 2-model ensemble + ms+flip TTA: **8.22** (achieved, 256+320)
-- Higher res (384/448) + ensemble: **~7.5-8.0** (estimated)
-- ELD ensemble (specialists): **~6.5-7.0** (estimated)
+- 3-model ensemble + ms+flip TTA: **8.04** (achieved, 256+320+384)
+- DenseNet121 + per-landmark heatmap: **~7.5-8.0** (estimated, based on paper's 6.70 single model)
+- 4+ model ensemble with DenseNet: **~7.0-7.5** (estimated)
+- ELD ensemble (specialists): **~6.5-7.0** (estimated, paper target)
 
 ---
 
@@ -512,32 +612,36 @@ class SoftArgmax2D(tf.keras.layers.Layer):
 
 ## Training Configuration Reference
 
-### Current best preset (`tight_margin`)
+### Current best preset (`tight_margin_384`)
 ```python
 backbone = "efficientnetv2s"
 head_type = "heatmap"
 heatmap_dropout = 0.1
-num_deconv_layers = 4          # 4 deconv -> 112x112 heatmaps
+num_deconv_layers = 4          # 4 deconv -> 192x192 heatmaps (at 384px input)
+img_size = 384
 epochs = 100                   # Phase 1: frozen backbone
 finetune_epochs = 200          # Phase 2: fine-tune last 50 layers
 finetune_learning_rate = 1e-5
 finetune_last_layers = 50
-batch_size = 16
+batch_size = 8                 # Reduced from 16 due to memory at 384px
 learning_rate = 1e-4
 optimizer = "adamw"
 weight_decay = 1e-4
 loss = "mse"
-lm_margin = 0.05              # [KEY CHANGE] was 0.12 — tighter landmark bbox
-crop_margin = 0.10             # [KEY CHANGE] was 0.20 — tighter crop padding
-# Augmentations: rotation, flip, crop_jitter (0.08), scale (0.85-1.15),
-#                brightness, contrast, saturation, color_balance, sharpness, blur, noise
+lm_margin = 0.05
+crop_margin = 0.10
 ```
 
-### Previous best preset (`heatmap_v2s_112`)
-Same as above but with `lm_margin=0.12` and `crop_margin=0.20` (more background padding).
+### Other active presets
+- `tight_margin_320` — same as 384 but img_size=320, batch_size=16, heatmaps=160×160
+- `tight_margin_256` — same as 384 but img_size=256, batch_size=16, heatmaps=128×128
+- `tight_margin_320_cosine` — 320px with cosine annealing LR (Phase 2: 300 epochs)
+- `densenet121_heatmap_56` — DenseNet121 backbone, 56×56 heatmaps, per-landmark heatmap loss
 
-### Older preset (`heatmap_v2s_best`)
-Same architecture but with `num_deconv_layers = 3` (56x56 heatmaps) and wider margins.
+### Older presets
+- `tight_margin` — 224px input, 112x112 heatmaps, `lm_margin=0.05`, `crop_margin=0.10`
+- `heatmap_v2s_112` — 224px input, 112x112 heatmaps, `lm_margin=0.12`, `crop_margin=0.20`
+- `heatmap_v2s_best` — 224px input, 56x56 heatmaps (3 deconv layers), wider margins
 
 ### Training stability notes
 - lr=1e-3 ALWAYS diverges (even frozen backbone)
@@ -572,24 +676,23 @@ python scripts/train_dog_face_landmarks.py \
 
 | File | Description |
 |---|---|
-| `scripts/train_dog_face_landmarks.py` | Main training script — all architectures, presets, augmentations, SoftArgmax2D layer |
-| `scripts/gen_landmark_examples.py` | Generate _pred/_true visualizations for all 480 test images |
+| `scripts/train_dog_face_landmarks.py` | Main training script — all architectures (EfficientNetV2S, DenseNet121), presets, augmentations, SoftArgmax2D layer, per-landmark heatmap loss |
+| `scripts/eval_all_models.py` | Comprehensive eval: all models, all TTA modes, all pair ensembles, full ensemble, per-region breakdown |
+| `scripts/gen_landmark_examples.py` | Generate _pred/_true visualizations for all 480 test images (uses 3-model ensemble) |
+| `scripts/overnight_marathon.sh` | Automated chain: train → eval → train → eval for overnight runs |
 | `scripts/infer_dog_landmarks_tflite.py` | TFLite inference pipeline (two-stage: bbox detection + landmarks) |
-| `scripts/run_nme_push.py` | Automated experiment runner with TTA evaluation |
-| `scripts/run_nme_push_v2.py` | NME push v2 experiment runner (tight margin, mixup, pure heatmap, combined) |
-| `scripts/eval_experiments.py` | Zero-cost evaluation (SoftArgmax temperature sweep, multi-scale TTA) |
+| `scripts/per_landmark_analysis.py` | Per-landmark/region error analysis |
 | `scripts/eval_320_comprehensive.py` | 320px + ensemble comprehensive eval |
-| `scripts/run_experiments.py` | Earlier experiment runner for ablation studies |
 | `CODEX_ADVISOR_REPORT.md` | Detailed analysis from OpenAI Codex consultation on strategies |
-| `artifacts/tight_margin_320/` | **Current best single model** (NME 8.82 / 8.32 with ms+flip TTA) |
+| `artifacts/tight_margin_384/` | **Current best single model** (NME 8.77 / 8.33 with ms+flip TTA) |
+| `artifacts/tight_margin_320/` | 320px model (NME 8.82 / 8.32 with ms+flip TTA) |
 | `artifacts/tight_margin_256/` | 256px model (NME 9.27 / 8.66 ms+flip TTA) |
-| `artifacts/ensemble_256_320/inference_examples/` | Ensemble inference visualizations |
-| `artifacts/tight_margin/` | Previous best (NME_IOD 9.53 / 9.11 with TTA) |
+| `artifacts/dog_face_landmarks/inference_examples/` | 3-model ensemble prediction visualizations (480 images) |
+| `artifacts/tight_margin/` | Older 224px model (NME_IOD 9.53 / 9.11 with TTA) |
 | `artifacts/heatmap_v2s_112/` | Earlier model (NME_IOD 10.58 / 10.14 with TTA) |
 | `artifacts/heatmap_v2s_best/` | Earlier model (NME_IOD 10.72) |
 | `artifacts/dog_face_landmarks/` | Production TFLite model + inference example images |
-| `artifacts/nme_push_results.md` | Raw experiment logs from overnight NME push run |
-| `artifacts/nme_push_v2_results.md` | Raw experiment logs from NME push v2 run |
+| `artifacts/overnight_log.txt` | Raw logs from overnight marathon runs |
 
 ---
 

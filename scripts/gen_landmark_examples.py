@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Generate GT and predicted landmark visualizations for test images.
 
-Uses 2-model ensemble (256+320) with multi-scale+flip TTA (12 passes)
-matching the best config: NME_IOD = 8.22.
+Uses 3-model ensemble (256+320+384) with multi-scale+flip TTA (18 passes)
+matching the best config: NME_IOD = 8.04.
 
 For each image produces:
   {stem}_landmarks_true.png  — ground-truth landmarks + bbox from DogFLW labels
@@ -45,8 +45,9 @@ BBOX_MODEL = Path("artifacts/dog_face_detector/dog_face_localizer_224_float16.tf
 LM_MODELS = [
     {"path": Path("artifacts/tight_margin_256/dog_face_landmarks_256_float16.tflite"), "img_size": 256},
     {"path": Path("artifacts/tight_margin_320/dog_face_landmarks_320_float16.tflite"), "img_size": 320},
+    {"path": Path("artifacts/tight_margin_384/dog_face_landmarks_384_float16.tflite"), "img_size": 384},
 ]
-OUT_DIR = Path("artifacts/ensemble_256_320/inference_examples")
+OUT_DIR = Path("artifacts/dog_face_landmarks/inference_examples")
 
 BBOX_IMG_SIZE = 224
 LM_MARGIN = 0.05
@@ -143,7 +144,7 @@ def flip_coords(coords_2d: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def predict_ensemble(image: Image.Image, pred_bbox: np.ndarray) -> np.ndarray:
-    """Run 2-model ensemble with multi-scale+flip TTA (12 passes).
+    """Run 3-model ensemble with multi-scale+flip TTA (18 passes).
 
     Returns predicted landmarks in original image coordinates [46, 2].
     """
@@ -172,7 +173,7 @@ def predict_ensemble(image: Image.Image, pred_bbox: np.ndarray) -> np.ndarray:
             coords_f = unscale_coords(coords_f, scale)
             all_preds.append(coords_f)
 
-    # Average all 12 predictions (normalized coords)
+    # Average all 18 predictions (normalized coords)
     avg_norm = np.mean(np.stack(all_preds, axis=0), axis=0)
 
     # Denormalize using the first model's crop meta (both share same crop_margin
@@ -194,7 +195,7 @@ def make_true_image(image: Image.Image, label_path: Path) -> Image.Image:
 
 
 def make_pred_image(image: Image.Image) -> Image.Image:
-    """Run 2-model ensemble + ms+flip TTA and draw predicted bbox + landmarks."""
+    """Run 3-model ensemble + ms+flip TTA and draw predicted bbox + landmarks."""
     arr_lb, lb_meta = letterbox_image(image, BBOX_IMG_SIZE)
     pred_bbox_norm = run_bbox_tflite(BBOX_MODEL, arr_lb)
     pred_bbox = deletterbox_bbox(pred_bbox_norm, **lb_meta)
@@ -211,9 +212,9 @@ def make_pred_image(image: Image.Image) -> Image.Image:
 def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     total = len(STEMS)
-    print(f"Generating {total} image pairs using 2-model ensemble (256+320) + ms+flip TTA")
+    print(f"Generating {total} image pairs using 3-model ensemble (256+320+384) + ms+flip TTA")
     print(f"  Models: {[m['path'].name for m in LM_MODELS]}")
-    print(f"  Scales: {SCALES}, flip=True -> 12 passes per image")
+    print(f"  Scales: {SCALES}, flip=True -> 18 passes per image")
     print(f"  Output: {OUT_DIR}\n")
 
     for i, stem in enumerate(STEMS):
