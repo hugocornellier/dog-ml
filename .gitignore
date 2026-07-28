@@ -1,6 +1,7 @@
 .venv/
 .idea/
 artifacts/
+checkpoints/
 
 __pycache__/
 *.py[cod]
