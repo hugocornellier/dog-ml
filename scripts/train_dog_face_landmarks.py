@@ -57,7 +57,8 @@ class ExperimentConfig:
     name: str = "default"
 
     # Architecture
-    backbone: str = "efficientnetb2"  # "efficientnetb2", "efficientnetv2s", or "densenet121"
+    backbone: str = "efficientnetb2"  # efficientnetb2 | efficientnetv2s | densenet121
+                                      # | mobilenetv3large | mobilenetv3small
     head_type: str = "dense"          # "dense" (GAP+FC) or "heatmap" (deconv+soft-argmax)
     heatmap_channels: int = 256       # intermediate channels in deconv head
     heatmap_dropout: float = 0.0      # SpatialDropout2D rate in deconv head
@@ -1085,6 +1086,88 @@ EXPERIMENT_PRESETS: dict[str, ExperimentConfig] = {
         nme_mode="iod",
         patience=50,
     ),
+    # --- Small models (MobileNetV3) ---
+    # Ported from the CatFLW sibling repo, where mobilenetv3large @384 with a
+    # 128-channel head exports at 11.0 MiB fp16 vs 54.6 MiB for efficientnetv2s.
+    # On cats it cost ~0.15 NME against efficientnetv2s at matched resolution and
+    # matched training length (3.482 vs 3.330). The size saving comes from both
+    # the backbone (4.2M vs 20.3M params) and halving heatmap_channels 256 -> 128.
+    "small_v3large_384": ExperimentConfig(
+        name="small_v3large_384",
+        backbone="mobilenetv3large",
+        head_type="heatmap",
+        heatmap_channels=128,
+        heatmap_dropout=0.1,
+        num_deconv_layers=4,
+        epochs=100,
+        finetune_epochs=200,
+        finetune_learning_rate=1e-5,
+        finetune_last_layers=60,
+        batch_size=8,
+        learning_rate=1e-4,
+        lr_schedule="constant",
+        loss="mse",
+        optimizer="adamw",
+        weight_decay=1e-4,
+        use_swa=False,
+        img_size=384,
+        lm_margin=0.05,
+        crop_margin=0.10,
+        aug_rotation=True,
+        aug_rotation_deg=15.0,
+        aug_flip=True,
+        aug_crop_jitter=True,
+        aug_crop_jitter_frac=0.08,
+        aug_scale=True,
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        nme_mode="iod",
+        patience=50,
+    ),
+    # Same as small_v3large_384 but with the long phase-2 schedule that gave the
+    # cat model its best result (400 finetune epochs instead of 200).
+    "small_v3large_384_long": ExperimentConfig(
+        name="small_v3large_384_long",
+        backbone="mobilenetv3large",
+        head_type="heatmap",
+        heatmap_channels=128,
+        heatmap_dropout=0.1,
+        num_deconv_layers=4,
+        epochs=100,
+        finetune_epochs=400,
+        finetune_learning_rate=1e-5,
+        finetune_last_layers=60,
+        batch_size=8,
+        learning_rate=1e-4,
+        lr_schedule="constant",
+        loss="mse",
+        optimizer="adamw",
+        weight_decay=1e-4,
+        use_swa=False,
+        img_size=384,
+        lm_margin=0.05,
+        crop_margin=0.10,
+        aug_rotation=True,
+        aug_rotation_deg=15.0,
+        aug_flip=True,
+        aug_crop_jitter=True,
+        aug_crop_jitter_frac=0.08,
+        aug_scale=True,
+        aug_brightness=True,
+        aug_contrast=True,
+        aug_saturation=True,
+        aug_color_balance=True,
+        aug_sharpness=True,
+        aug_blur=True,
+        aug_noise=True,
+        nme_mode="iod",
+        patience=50,
+    ),
     # --- DenseNet121 + low-res heatmap supervision (replicates paper's 6.70) ---
     # Key insight: heatmap supervision works at LOW resolution (28-56px),
     # not HIGH resolution (112-160px). At 56x56, sigma=2 covers ~0.4% of
@@ -1607,7 +1690,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use-swa", action="store_true", default=None)
     p.add_argument("--no-swa", dest="use_swa", action="store_false")
     p.add_argument("--nme-mode", choices=["crop", "iod"], default=None)
-    p.add_argument("--backbone", choices=["efficientnetb2", "efficientnetv2s", "densenet121"], default=None)
+    p.add_argument("--backbone", choices=["efficientnetb2", "efficientnetv2s", "densenet121",
+                                          "mobilenetv3large", "mobilenetv3small"], default=None)
     p.add_argument("--head-type", choices=["dense", "heatmap"], default=None)
     p.add_argument("--unfreeze-backbone", action="store_true", default=None)
     p.add_argument("--no-unfreeze-backbone", dest="unfreeze_backbone", action="store_false")
@@ -2284,7 +2368,14 @@ class SoftArgmax2D(tf.keras.layers.Layer):
         self.beta = beta
 
     def build(self, input_shape):
-        _, h, w, _ = input_shape
+        _, h, w, k = input_shape
+        # Keep the spatial dims as Python ints so call() can use static shapes.
+        # Reading them back with tf.shape() at call time makes the reshapes
+        # dynamic, leaving a dynamic-sized tensor in the exported graph: TFLite
+        # warns that static-shape-only delegates cannot cover it, and LiteRT
+        # Next's compiled runtime returns all-zero output then fails on the
+        # second invocation. Only the batch dim needs to stay dynamic, as -1.
+        self._h, self._w, self._k = int(h), int(w), int(k)
         # Coordinate grids normalized to [0, 1].
         # x varies along width (axis=1), y varies along height (axis=0).
         x_coords = tf.linspace(0.0, 1.0, w)  # [W]
@@ -2296,15 +2387,12 @@ class SoftArgmax2D(tf.keras.layers.Layer):
 
     def call(self, heatmaps):
         # heatmaps: (B, H, W, K)
-        b = tf.shape(heatmaps)[0]
-        h = tf.shape(heatmaps)[1]
-        w = tf.shape(heatmaps)[2]
-        k = tf.shape(heatmaps)[3]
+        h, w, k = self._h, self._w, self._k
 
         # Spatial softmax with temperature: flatten H*W, softmax, reshape back.
-        flat = tf.reshape(heatmaps, [b, h * w, k])        # (B, H*W, K)
+        flat = tf.reshape(heatmaps, [-1, h * w, k])       # (B, H*W, K)
         weights = tf.nn.softmax(flat * self.beta, axis=1)   # (B, H*W, K)
-        weights = tf.reshape(weights, [b, h, w, k])         # (B, H, W, K)
+        weights = tf.reshape(weights, [-1, h, w, k])        # (B, H, W, K)
 
         # Weighted sum of coordinates.
         x = tf.reduce_sum(weights * self.x_grid, axis=[1, 2])  # (B, K)
@@ -2312,7 +2400,7 @@ class SoftArgmax2D(tf.keras.layers.Layer):
 
         # Interleave as [x0, y0, x1, y1, ...].
         coords = tf.stack([x, y], axis=-1)  # (B, K, 2)
-        return tf.reshape(coords, [b, k * 2])  # (B, K*2)
+        return tf.reshape(coords, [-1, k * 2])  # (B, K*2)
 
     def get_config(self):
         config = super().get_config()
@@ -2380,6 +2468,24 @@ def build_model(cfg: ExperimentConfig) -> tf.keras.Model:
         backbone = tf.keras.applications.EfficientNetV2S(
             input_shape=(img_size, img_size, 3),
             include_top=False,
+            weights=None if not pretrained else "imagenet",
+        )
+    elif cfg.backbone == "mobilenetv3large":
+        # MobileNetV3Large expects [0, 255] input (has internal preprocessing).
+        x = tf.keras.layers.Rescaling(scale=255.0, offset=0.0, name="to_0_255")(inputs)
+        backbone = tf.keras.applications.MobileNetV3Large(
+            input_shape=(img_size, img_size, 3),
+            include_top=False,
+            minimalistic=False,
+            weights=None if not pretrained else "imagenet",
+        )
+    elif cfg.backbone == "mobilenetv3small":
+        # MobileNetV3Small expects [0, 255] input (has internal preprocessing).
+        x = tf.keras.layers.Rescaling(scale=255.0, offset=0.0, name="to_0_255")(inputs)
+        backbone = tf.keras.applications.MobileNetV3Small(
+            input_shape=(img_size, img_size, 3),
+            include_top=False,
+            minimalistic=False,
             weights=None if not pretrained else "imagenet",
         )
     else:  # efficientnetb2
@@ -2524,6 +2630,7 @@ def get_backbone(model: tf.keras.Model) -> tf.keras.Model:
     for layer in model.layers:
         if isinstance(layer, tf.keras.Model) and (
             layer.name.startswith("efficientnet") or layer.name.startswith("densenet")
+            or layer.name.startswith("Mobilenet") or layer.name.startswith("mobilenet")
         ):
             return layer
     raise RuntimeError("Backbone not found")
