@@ -62,6 +62,12 @@ class ExperimentConfig:
     head_type: str = "dense"          # "dense" (GAP+FC) or "heatmap" (deconv+soft-argmax)
     heatmap_channels: int = 256       # intermediate channels in deconv head
     heatmap_dropout: float = 0.0      # SpatialDropout2D rate in deconv head
+    # Optional per-deconv-layer channel widths, e.g. (128, 128, 64, 32).  None
+    # means every deconv uses heatmap_channels.  The last deconv runs at the
+    # highest spatial resolution and dominates head cost -- measured at 34.2 ms
+    # of the 57 ms total at 384px -- so tapering it is the main latency lever
+    # that does not touch input resolution.
+    deconv_channels: tuple[int, ...] | None = None
 
 
     # Training schedule
@@ -1716,6 +1722,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--heatmap-sigma", type=float, default=None)
     p.add_argument("--coord-loss-weight", type=float, default=None)
     p.add_argument("--num-deconv-layers", type=int, default=None)
+    p.add_argument("--heatmap-channels", type=int, default=None)
+    p.add_argument(
+        "--deconv-channels", type=str, default=None,
+        help="Comma-separated per-deconv widths, e.g. 128,128,64,32. "
+             "Must have exactly --num-deconv-layers entries.",
+    )
     return p.parse_args()
 
 
@@ -1763,6 +1775,11 @@ def resolve_config(args: argparse.Namespace) -> ExperimentConfig:
         "heatmap_sigma": args.heatmap_sigma,
         "coord_loss_weight": args.coord_loss_weight,
         "num_deconv_layers": args.num_deconv_layers,
+        "heatmap_channels": args.heatmap_channels,
+        "deconv_channels": (
+            tuple(int(c) for c in args.deconv_channels.split(","))
+            if args.deconv_channels else None
+        ),
     }
     for key, val in _override.items():
         if val is not None:
@@ -2410,18 +2427,32 @@ class SoftArgmax2D(tf.keras.layers.Layer):
 
 def _build_deconv_head(backbone_output, num_landmarks: int, channels: int,
                        dropout: float = 0.0, num_deconv: int = 3,
-                       softargmax_beta: float = 1.0):
+                       softargmax_beta: float = 1.0,
+                       deconv_channels: tuple[int, ...] | None = None):
     """SimpleBaseline-style deconv head: N× deconv + 1×1 conv + soft-argmax.
 
     backbone_output: (B, 7, 7, C) feature map from EfficientNet
     num_deconv: 3 for 56×56 heatmaps, 4 for 112×112
+    deconv_channels: per-layer widths; None means `channels` everywhere.  Each
+        deconv doubles the spatial size, so a uniform width makes the last
+        layer by far the most expensive one.
     Returns: (heatmaps_tensor, coords_tensor)
     """
     x = backbone_output
 
+    if deconv_channels is None:
+        widths = [channels] * num_deconv
+    else:
+        widths = list(deconv_channels)
+        if len(widths) != num_deconv:
+            raise ValueError(
+                f"deconv_channels has {len(widths)} entries but num_deconv_layers "
+                f"is {num_deconv}"
+            )
+
     for i in range(num_deconv):
         x = tf.keras.layers.Conv2DTranspose(
-            channels, kernel_size=4, strides=2, padding="same",
+            widths[i], kernel_size=4, strides=2, padding="same",
             use_bias=False, name=f"deconv_{i+1}",
         )(x)
         x = tf.keras.layers.BatchNormalization(name=f"deconv_bn_{i+1}")(x)
@@ -2504,6 +2535,7 @@ def build_model(cfg: ExperimentConfig) -> tf.keras.Model:
             x, NUM_LANDMARKS, cfg.heatmap_channels,
             dropout=cfg.heatmap_dropout, num_deconv=cfg.num_deconv_layers,
             softargmax_beta=cfg.softargmax_beta,
+            deconv_channels=cfg.deconv_channels,
         )
         coords = tf.keras.layers.Identity(name="landmarks_xy")(coords)
         if cfg.pure_heatmap_supervision:
@@ -2879,6 +2911,36 @@ def evaluate_model(model: tf.keras.Model, val_ds: tf.data.Dataset) -> dict[str, 
 # ---------------------------------------------------------------------------
 
 def export_tflite(model: tf.keras.Model, out_path: Path) -> None:
+    """Convert to float16 TFLite from the Keras model (dynamic batch dimension).
+
+    Do not "fix" this to convert from a batch-1 concrete function without
+    re-measuring first. The obvious-looking argument for doing so is wrong on the
+    runtime these models actually ship on, and it was tried:
+
+    Converting this way leaves the batch dimension dynamic, so Conv2DTranspose
+    builds each deconv's output shape at run time out of SHAPE/STRIDED_SLICE/PACK
+    and TFLite logs "Attempting to use a delegate that only supports static-sized
+    tensors ...". Pinning the batch to 1 removes all of that (295 ops -> 279) and
+    produces identical predictions. It looks like a free win, and on
+    flutter_litert 3.6.0 it was one. On 3.7.0 it is a 2x regression:
+
+      | litert | export  | median invoke | val NME_IOD |
+      |--------|---------|---------------|-------------|
+      | 3.6.0  | dynamic |      97.6 ms  |   8.5664    |
+      | 3.6.0  | static  |      61.3 ms  |   8.5664    |
+      | 3.7.0  | dynamic |      29.0 ms  |   8.5664    |
+      | 3.7.0  | static  |      59.8 ms  |   8.5664    |
+
+    3.7.0 got much faster on the dynamic graph specifically, and the static graph
+    did not move. Accuracy is identical in all four cells, so this is purely about
+    which graph the delegate handles better in a given release.
+
+    The lesson is not "dynamic is better" either. It is that this choice is a
+    property of the runtime version, not of the model, and it has flipped once
+    already. Re-measure both against the version the packages resolve, with
+    scripts/bench_litert_macos.py, before changing this. scripts/reexport_static.py
+    produces the static variant from a trained best.keras without retraining.
+    """
     converter = tf.lite.TFLiteConverter.from_keras_model(model)
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
     converter.target_spec.supported_types = [tf.float16]

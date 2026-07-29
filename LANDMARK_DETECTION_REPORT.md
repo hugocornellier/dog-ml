@@ -6,6 +6,64 @@ This document is a living journal of our work improving dog facial landmark dete
 
 ---
 
+## READ THIS BEFORE EXPORTING ANY MODEL
+
+**The static-vs-dynamic export choice is a property of the LiteRT version, not of
+the model, and it has already flipped once. Measure, do not reason.**
+
+Keras' `from_keras_model` conversion leaves the batch dimension dynamic, so every
+`Conv2DTranspose` computes its output shape at run time from
+`SHAPE` / `STRIDED_SLICE` / `PACK`. TFLite then logs:
+
+```
+Attempting to use a delegate that only supports static-sized tensors with a
+graph that has dynamic-sized tensors (tensor#421 ...)
+```
+
+Converting from a batch-1 concrete function removes all of it (295 ops -> 279,
+all `SHAPE` and `STRIDED_SLICE` gone) and produces identical predictions. That
+looks unambiguously like a free win. It is not:
+
+| flutter_litert | export | median `invoke()` | val NME_IOD |
+|---|---|---|---|
+| 3.6.0 | dynamic (shipped) | 97.6 ms | 8.5664 |
+| 3.6.0 | static | **61.3 ms** | 8.5664 |
+| 3.7.0 | dynamic (shipped) | **29.0 ms** | 8.5664 |
+| 3.7.0 | static | 59.8 ms | 8.5664 |
+
+All 480 val images, XNNPACK, 4 threads, same process. **Accuracy is identical in
+every cell**, so this is purely about which graph shape the delegate handles well
+in a given release.
+
+On 3.6.0 the static export was a 1.59x win. On 3.7.0 it is a **2.06x loss**: that
+release got dramatically faster on the dynamic graph while the static graph did
+not move at all. The cat model reproduces the inversion exactly (94.5 / 59.8 /
+28.2 / 59.9).
+
+This was shipped as dog_detection 2.0.1 and cat_detection 2.0.1 on the strength of
+the 3.6.0 measurement, then **reverted** when the packages moved to 3.7.0. The
+error was measuring against one runtime version and treating the result as a
+property of the model.
+
+**Checklist for every new model:**
+
+1. Export both ways: `export_tflite` (dynamic) and `scripts/reexport_static.py`
+   (static, works from a trained `best.keras`, no retraining).
+2. Benchmark **both** against the flutter_litert version the packages actually
+   resolve, using `scripts/bench_litert_macos.py` (set `LITERT_VERSION`). Never
+   against `tf.lite` Python, which is a third runtime again and ranks them
+   differently from both.
+3. Confirm accuracy on the converted file over the **full** val split with
+   `scripts/pareto_harness.py`. Do not use the 16-image `tflite_sanity` figure in
+   `model_metadata.json`: it is a different metric on a different sample size, and
+   comparing it to the Keras number invented a "TFLite conversion cost" that does
+   not exist (Keras 8.5643 vs TFLite 8.5664 over all 480).
+4. Re-run step 2 on every flutter_litert bump. That is the step that would have
+   caught this.
+
+Do not assume the delegate warning is harmless, and do not assume removing it
+helps. Both readings have been wrong here.
+
 ## Quick Reference
 
 ### Current Best Model
@@ -718,4 +776,320 @@ python scripts/train_dog_face_landmarks.py \
 
 5. **AdamW on M1/M2 Macs**: TensorFlow warns about slow performance. Training still works but is ~10-15% slower than on CUDA GPUs. Use `tf.keras.optimizers.legacy.AdamW` if speed matters.
 
-6. **TFLite dynamic tensor warning**: The SoftArgmax2D layer generates a dynamic-sized tensor warning during TFLite conversion. This is harmless — the model runs correctly at inference.
+6. **TFLite dynamic tensor warning**: the warning is real, but whether removing
+   it helps depends entirely on the LiteRT version. It cost 36% of inference on
+   flutter_litert 3.6.0 and is a 2x *win* on 3.7.0. Do not act on it without
+   measuring against the version the packages resolve. See "READ THIS BEFORE
+   EXPORTING ANY MODEL" at the top.
+
+---
+
+## Round 8: Pareto Push at ~11MB (size / accuracy / speed, no trades)
+
+Different objective from every round above. Rounds 1-7 chased NME at any cost and
+ended on an 18-forward-pass, 54.6MB ensemble. This round holds the shipped
+`dog_detection` model's size at ~11MB and requires that **nothing regresses**: a
+change counts only if it is same-or-better on all three of size, accuracy and
+latency. Trades were rejected.
+
+**Headline: the shipped model was leaving a 1.56x speedup on the table in the
+TFLite export, at literally zero cost.** Everything else tried in this round
+either failed or is still a trade.
+
+### Measurement setup (read this before comparing to older numbers)
+
+Older rounds quote numbers from several different scripts. This round routes
+everything through one harness, `scripts/pareto_harness.py`:
+
+- **Split**: all 480 DogFLW `test` images, `lm_margin=0.05`, `crop_margin=0.10`,
+  384px, crops built by calling the training script's own `load_split_records`
+  and `crop_and_normalize` so eval geometry cannot drift from training geometry.
+  Note this split is also the validation set used for early stopping, so absolute
+  numbers are optimistic; it is still the right basis for comparing candidates.
+- **Two accuracy metrics**, because the repo and the Flutter package publish
+  different ones:
+  - *crop-space* NME_IOD, normalizing x by crop width and y by crop height. This
+    is the training metric (`landmark_nme_iod`). Baseline = **8.566**.
+  - *absolute-pixel* NME_IOD, mapping predictions back to original image pixels.
+    This is what `dog_detection`'s CHANGELOG publishes. Baseline = **8.038**,
+    which reproduces the published 8.04 exactly and validates the harness.
+- **Latency** is reported from two runtimes and they are never mixed:
+  - `tf.lite` Python, XNNPACK, 4 threads (for ranking candidates in-repo).
+  - **The runtime the package actually ships**: `libtensorflowlite_c-mac.dylib`
+    from flutter_litert 3.6.0, driven directly over ctypes by
+    `scripts/bench_litert_macos.py`, reproducing `InterpreterFactory`'s macOS
+    auto-mode (XNNPACK delegate, `numThreads = min(4, nproc)` = 4). This is the
+    authoritative figure.
+
+**Correction to a long-standing assumption**: there is no meaningful TFLite
+conversion cost. The `tflite_sanity` field in `model_metadata.json` is a
+**16-image** crop-space mean NME (0.0304) and was being compared against the
+**480-image** Keras figure (0.0280). That gap is sample size, not conversion.
+Measured properly over all 480: Keras 8.5643 vs TFLite 8.5664 crop-space NME_IOD,
+a difference of 0.002.
+
+### 1. Static-shape TFLite export (shipped, then REVERTED)
+
+This was the headline result of the round and it did not survive a dependency
+bump. Full detail in "READ THIS BEFORE EXPORTING ANY MODEL" at the top of the
+file; summary here so the round reads correctly.
+
+`export_tflite` converted with `from_keras_model`, leaving the batch dimension
+dynamic, so Conv2DTranspose computed each deconv's output shape at run time via
+`SHAPE`/`STRIDED_SLICE`/`PACK`, leaving a dynamic-sized tensor that TFLite
+excluded from the XNNPACK delegate. Converting from a batch-1 concrete function
+folds it away: 295 ops -> 279, predictions identical to 6.6e-7 over all 480
+images, file 11.019 -> 11.013 MB.
+
+On flutter_litert **3.6.0** that was worth 102.4 ms -> 65.6 ms, a 1.56x free
+speedup, and it shipped as dog_detection 2.0.1 (and cat_detection 2.0.1).
+
+On flutter_litert **3.7.0** it is a 2.06x regression:
+
+| flutter_litert | dynamic (shipped) | static |
+|---|---|---|
+| 3.6.0 | 97.6 ms | **61.3 ms** |
+| 3.7.0 | **29.0 ms** | 59.8 ms |
+
+Accuracy is 8.5664 in all four cells. 3.7.0 got much faster on the dynamic graph
+while the static graph did not move. Both packages were reverted to their original
+assets and the 2.0.1 entries withdrawn.
+
+**Why this happened, because the process failure is the transferable part:** the
+benchmark was correct, the accuracy verification was correct, and the conclusion
+was still wrong, because a single-version measurement was treated as a property of
+the model. Latency under a delegate is a property of the (model, runtime) pair.
+The packages moved 3.6.0 -> 3.7.0 with no code change on our side and the shipped
+optimisation inverted.
+
+`scripts/reexport_static.py` is kept: it produces the static variant from a
+trained `best.keras` without retraining, and may be right again on a later
+release. `export_tflite` is back to the dynamic path, with the measurement table
+in its docstring so the next person does not re-derive it.
+
+### 2. Where the time actually goes (`scripts/profile_head.py`)
+
+Truncated static exports, timed in the same harness, at 384px:
+
+| stage | cumulative | marginal |
+|---|---|---|
+| backbone + deconv1 | 9.8 ms | |
+| + deconv2 | 12.0 ms | +2.2 |
+| + deconv3 | 20.7 ms | +8.6 |
+| **+ deconv4** | **54.9 ms** | **+34.2** |
+| + heatmap_conv | 56.5 ms | +1.6 |
+| + soft_argmax | 57.0 ms | +0.5 |
+
+The MobileNetV3Large backbone is not the bottleneck. **The deconv head is ~83% of
+inference, and the single last deconv (96 -> 192 at 128 channels) is 60%.** Any
+further speed work belongs there. SoftArgmax2D costs 0.5 ms, so changing
+coordinate extraction is free on latency.
+
+### 3. Coordinate extraction sweep (FAILED, and conclusively)
+
+Since extraction is free, every plausible alternative was swept over the raw
+heatmaps of the shipped model, all 480 images (`scripts/eval_extraction.py`):
+
+| method | crop-space NME_IOD | vs baseline |
+|---|---|---|
+| **soft-argmax beta=1 (shipped)** | **8.567** | -- |
+| soft-argmax beta=2 | 9.659 | +1.09 |
+| local soft-argmax r=25, beta=1 | 10.490 | +1.92 |
+| soft-argmax beta=4 | 11.764 | +3.20 |
+| local soft-argmax r=9, beta=1 | 15.646 | +7.08 |
+| argmax (hard) | 15.872 | +7.30 |
+| **argmax + parabolic subpixel** | **15.872** | **+7.31** |
+| soft-argmax beta=0.5 | 42.158 | +33.59 |
+
+`argmax_with_refinement` was the cheapest thing on the "free accuracy" list. It is
+worthless here, and the reason is structural: **the model's heatmaps are not
+peak-shaped.** Trained with coordinate MSE through a global beta=1 soft-argmax,
+the network is free to put probability mass anywhere as long as the *global
+expectation* lands on the landmark. Its modes are therefore in the wrong place,
+and every estimator that trusts the peak (argmax, parabolic fit, small-window
+local soft-argmax) roughly doubles the error. Larger windows monotonically
+improve back toward the global estimator, exactly as that explanation predicts.
+
+This closes the direction: extraction cannot be improved without also changing
+the training objective, and the training objective that would make peaks
+meaningful is heatmap supervision, which is covered next.
+
+### 4. Two directions the journal listed as open are already closed
+
+Both were sitting in `artifacts/` undocumented, from runs after this journal's
+last update (2026-03-03):
+
+- **Per-landmark heatmap supervision** (`artifacts/dlc_densenet121_224/`,
+  DenseNet121, pure heatmap supervision, per-landmark normalized loss, sigma=3.0,
+  softargmax_beta=50, 200 epochs). This is the exact "biggest untapped gap" the
+  journal recommends as next step #1, including the per-landmark normalization
+  that was supposed to fix the background-dominated loss. It ran to completion and
+  **failed**: TFLite sample NME 0.2107 against the baseline's 0.030, i.e. ~7x
+  worse. Heatmap-MSE supervision has now failed in four distinct forms (dual
+  loss, pure sigma=2.5/3.5/10, per-landmark normalized). It should be treated as
+  closed for this codebase, not as a promising lead.
+- **ELD-style ensemble** (`artifacts/eld/`, `artifacts/eld_v2/`), the journal's
+  recommended step #5 and the paper's route from ~8.5 to 6.52. Built and
+  evaluated on all 480: **10.02** with GT centers, **9.15** with predicted
+  centers. Both are *worse* than the single 11MB model's 8.566, and they take
+  245-421 s for 480 images (0.5-0.9 s/image) against 65 ms. Closed on both axes.
+
+### 5. int8 dynamic-range quantization (FAILED: a trade, not a win)
+
+Re-exported through the same static-shape concrete-function path so only the
+weight precision differs (`scripts/reexport_static.py --int8`). Halves the file
+and collapses the 140 fp16 `DEQUANTIZE` ops to 4 (279 ops -> 143).
+
+| | static fp16 | static int8 |
+|---|---|---|
+| size | 11.01 MB | **5.79 MB** |
+| crop-space NME_IOD | 8.5664 | 8.6708 |
+| abs-pixel NME_IOD | 8.0383 | 8.1304 |
+
+Paired per-image delta **+0.1044 +- 0.0206 (t = 5.07)**, 288 of 480 images worse.
+That is a real regression, not noise, so under this round's rule int8 is
+**rejected** despite being an excellent size win. It is the obvious lever to
+revisit if the size budget ever tightens below 11MB and 0.1 NME becomes
+affordable, but it does not qualify here.
+
+### 6. Cheap-head candidates (latency and size measured, accuracy in progress)
+
+Latency and file size do not depend on trained weights, so all head shapes were
+exported and timed untrained first (`scripts/screen_head_shapes.py`), and only
+shapes that actually buy something got training time. Added
+`--heatmap-channels` and `--deconv-channels` to the training script for this.
+
+| head | heatmap res | size MB | median ms (litert 3.7.0, dynamic) | vs baseline |
+|---|---|---|---|---|
+| 4 deconv, uniform 128 (baseline) | 192^2 | 11.02 | 28.4 | -- |
+| **4 deconv, 128/96/64/48** | 192^2 | **10.17** | **14.4** | **1.97x** |
+| 4 deconv, 128/128/96/64 | 192^2 | 10.58 | 18.3 | 1.55x |
+| 3 deconv, uniform 128 | 96^2 | 10.52 | 12.6 | 2.25x |
+| 4 deconv, 192/96/64/48 (wide first) | 192^2 | 12.23 | 15.6 | 1.82x |
+
+These are **dynamic** exports timed on flutter_litert **3.7.0**, i.e. exactly how
+the models ship. An earlier version of this table gave static exports timed on
+3.6.0 (baseline 56.8 ms, taper 21.2 ms); those numbers are not comparable to
+anything shipped and were replaced after the export inversion described at the top
+of this file. `scripts/screen_head_shapes_dynamic.py` regenerates this table.
+
+The important survival check: 3.7.0's large speedup on the dynamic graph did **not**
+come from handling the deconv head for free. The head still dominates, and a
+tapered head is still worth roughly 2x. So the cheap-head direction remains live
+even though the static-export direction died.
+
+Tapering the last deconv keeps the full 192^2 heatmap resolution while cutting
+head cost ~5x, because transposed-conv cost scales with output resolution times
+in-channels times out-channels while parameter count only scales with the channel
+product. It is smaller too.
+
+**Accuracy screening protocol**: phase 1 freezes the backbone and trains the head
+alone, which makes it the right cheap test for head capacity specifically, at
+~1 hour per candidate against ~6 hours for the full two-phase run. Baseline
+phase-1 reference is **10.574** (best at epoch 80, early-stopped at 87).
+
+| candidate | heatmap res | phase-1 best | vs baseline |
+|---|---|---|---|
+| baseline (uniform 128) | 192^2 | 10.5740 | -- |
+| **4 deconv 128/96/64/48** | 192^2 | **10.7152** | +0.141 |
+| 3 deconv uniform 128 | 96^2 | 10.7549 | +0.181 |
+
+**Run-to-run noise floor, measured, read this before ranking anything above.**
+The full run re-trained the taper's phase 1 from the identical preset and seed and
+got **10.7989**, against the screen's **10.7152**. Same config, same code, 0.084
+apart. Metal's non-deterministic reductions make phase-1 outcomes vary by roughly
+that much, so **differences below ~0.1 in this table are not signal**.
+
+That kills any ranking between the two cheap heads: 10.7152 vs 10.7549 is a 0.04
+difference against a 0.08 noise floor. The defensible statement is only that both
+cheap heads land ~0.15 to 0.20 behind the baseline and are indistinguishable from
+each other. An earlier draft of this section claimed the taper was "better on
+accuracy"; that was over-reading noise.
+
+The taper still gets the full run, but on grounds that do not depend on the
+disputed 0.04: it is the smaller file (10.16 vs 10.51 MB) and it keeps the full
+192^2 heatmap resolution, so if it works it is the better artifact.
+
+What the pair does support, jointly, is that neither axis is free. Thinning
+channels costs ~0.15 and halving heatmap resolution costs ~0.18, and both are
+comfortably outside the noise floor even though their difference is not.
+
+The taper is behind, but it had not stopped improving when phase 1 hit its
+100-epoch cap, whereas the baseline had already early-stopped at 87. Since the
+baseline gained 2.01 in phase 2 (10.574 -> 8.564), a taper that gains only the
+same amount lands at ~8.71, which is a regression and **not shippable** under
+this round's rule. It is being given a longer phase 2 (600 epochs vs 400) to test
+whether the deficit is a convergence-rate artifact rather than a capacity
+ceiling. Training cost is not one of the three axes, so a longer schedule is
+legitimate, but it will be reported plainly if that is what the result depends on.
+
+### 7. Tapered deconv head (REJECTED: a trade, ~1.97x faster for ~0.15 NME)
+
+Full two-phase run, `--deconv-channels 128,96,64,48`, phase 2 extended to 600 epochs
+to give the slower-converging head room to catch up. **Stopped at epoch 409 of 600
+and rejected.** Reason it could be called early is below, and it is the most
+transferable part of this entry.
+
+| | baseline | taper (128/96/64/48) |
+|---|---|---|
+| phase-1 best | 10.5740 | 10.7989 |
+| phase-2 best at ~epoch 399 | **8.5643** | **8.6855** |
+| phase-2 last-30 mean (the *level*) | **8.6077** | **8.7543** |
+| last-30 sd | 0.0186 | 0.0284 |
+| size | 11.02 MB | 10.17 MB |
+| latency (litert 3.7.0, dynamic, 4t) | 28.4 ms | **14.4 ms** |
+
+**Compare levels, not best-vs-best.** The headline "best" figures differ by 0.121,
+but that comparison is biased: `best` is the minimum of a noisy series, and the
+longer schedule gives the taper more draws. The taper's 8.6855 sits **2.4 sd below
+its own running level** and was not approached again in the following 17 epochs
+(8.77, 8.76, 8.75, 8.73, 8.80, 8.77, 8.74, ...). On last-30 means the gap is
+**+0.147**, and that is the honest number.
+
+This matters beyond this one experiment. The val split here is also the split that
+early stopping and best-weight restoration monitor, so *any* longer schedule buys
+extra chances at a lucky minimum on the exact metric used to judge it. Extending
+phase 2 from 400 to 600 epochs to "let the cheaper head catch up" was a defensible
+idea, but a candidate that reaches parity only via its own best-epoch draw has not
+reached parity. Judge the level.
+
+**Why 190 more epochs would not have closed it.** The baseline's level was improving
+~0.02 to 0.03 per 50 epochs at that stage and the taper's trend was flatter. Closing
+0.147 was not in reach. The TFLite export was not needed either: conversion costs
+about 0.002 NME (Keras 8.5643 vs TFLite 8.5664 on the baseline), against a 0.147 gap
+and a paired per-image SEM of about 0.02. That is 6 to 7 sigma, so no measurement
+refinement rescues it.
+
+**Verdict: a trade.** 1.97x faster and 0.85 MB smaller for about 0.15 NME. Under this
+round's rule that is rejected, and the baseline head stays.
+
+Combined with the 3-deconv screen, the shape of the frontier is now clear enough to
+state: **the deconv head is not over-parameterised.** Thinning channels costs about
+0.15, halving heatmap resolution costs about 0.18, and both are far outside the
+~0.08 phase-1 noise floor. Head cost cannot be bought down for free on this
+architecture.
+
+### Round 8 status
+
+| candidate | size | NME_IOD (TFLite, 480 val) | latency (flutter_litert 3.7.0, 4t) | verdict |
+|---|---|---|---|---|
+| shipped baseline (dynamic) | 11.019 MB | 8.566 crop / 8.038 abs | 29.0 ms | reference |
+| static re-export | 11.013 MB | 8.566 / 8.038 (identical) | 59.8 ms | **REVERTED**: won on 3.6.0, 2.06x loss on 3.7.0 |
+| better coordinate extraction | -- | 9.66 to 42.2 | -- | failed |
+| int8 (static) | 5.79 MB | 8.671 / 8.130 | not re-measured | trade, rejected |
+| per-landmark heatmap supervision | -- | ~7x worse | -- | failed (closed) |
+| ELD ensemble | -- | 9.15 / 10.02 | 500-900 ms | failed (closed) |
+| 3 deconv head (96^2 heatmaps) | 10.52 MB | phase-1 10.755 vs 10.574 | 12.6 ms | behind on accuracy, dropped |
+| 4 deconv taper 128/96/64/48 | 10.17 MB | 8.754 level / 8.686 best | 14.4 ms | **trade, rejected** (1.97x faster for +0.15) |
+
+**Nothing from this round is currently shipped.** The baseline is untouched.
+
+Head-shape latency has been re-measured as dynamic exports on 3.7.0 (see the table
+in section 6), so the cheap-head candidates are judged against the 28.4 ms baseline
+on the same footing. The tapered head is worth 1.97x, and section 7 shows it costs
+~0.15 NME, so it is a trade and was rejected.
+
+**Nothing from Round 8 ships. The baseline is untouched on all three axes.** What the
+round produced instead is a measurement harness that reproduces the package's own
+published figure, five closed directions, and one corrected piece of guidance that
+had been wrong in this journal for six rounds.
