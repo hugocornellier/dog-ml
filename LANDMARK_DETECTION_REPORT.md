@@ -1069,6 +1069,61 @@ state: **the deconv head is not over-parameterised.** Thinning channels costs ab
 ~0.08 phase-1 noise floor. Head cost cannot be bought down for free on this
 architecture.
 
+### 8. Unfusing the deconv ReLU makes the model GPU-delegatable (5.25x, not yet shipped)
+
+The one direction in this round that produced a large win, found after the Pareto
+work had otherwise concluded. It is a graph rewrite, not a retrain: same weights,
+same size, numerically identical output.
+
+The Metal GPU delegate refuses the deconv head with `TRANSPOSE_CONV: Max version
+supported: 3. Requested version 4.` The reason the models declare v4 is that the
+converter folds `Conv2DTranspose -> BatchNorm -> ReLU` into one op, giving four
+inputs (folded-BN bias) and `fusedActivationFunction = RELU`. Carrying a fused
+activation is what requires v4, and the GPU delegate caps at v3.
+
+Moving each ReLU out into a separate `RELU` op, which the delegate does support,
+drops the opcode to v3 and makes the whole graph delegatable:
+
+    TRANSPOSE_CONV(act=RELU) -> T     becomes
+    TRANSPOSE_CONV(act=NONE) -> T_pre  then  RELU(T_pre) -> T
+
+Keeping T's identity means no downstream consumer is rewired.
+`scripts/unfuse_transpose_conv_relu.py` does this on the flatbuffer directly.
+
+Measured over all 480 val images, flutter_litert 3.7.0, macOS arm64 (M4 Max):
+
+| model | backend | NME_IOD | median invoke |
+|---|---|---|---|
+| shipped dynamic | xnnpack | 8.5664 | 26.83 ms |
+| static, v4 | metal | 8.5664 | 30.25 ms |
+| **static, ReLU unfused** | **metal** | **8.5665** | **5.11 ms** |
+| static, ReLU unfused | xnnpack | 8.5664 | 58.00 ms |
+
+Numerically identical to the shipped model on CPU (max per-coordinate difference
+**6.6e-07**), and the GPU agrees with the CPU to 1.7e-04, which is fp16 GPU
+precision. **5.25x** against the best shipped configuration at unchanged accuracy and
+unchanged size.
+
+**Why this is not shipped.** Look at the last row. The unfused static graph is 58.00 ms
+under XNNPACK, which is 2.2x *slower* than the shipped model, for the reason in section
+1: with static shapes XNNPACK claims the deconv and runs a slower kernel than the
+built-in ruy one. So this model only wins when paired with the GPU delegate, and
+`InterpreterFactory` auto-mode picks XNNPACK on macOS and Android, GPU only on iOS.
+Swapping the asset alone would be a large regression on two of three platforms. The
+model and the delegate choice have to move together, which is a package-level decision.
+
+Also unverified: the 5.11 ms is an M4 Max GPU number, medians exclude 10 warmup
+invocations so host-to-device transfer is under-counted for single-shot use, and iOS
+has never actually run this graph on GPU (the delegate no-ops there today).
+
+**The better fix is upstream of this repo.** `Conv2DTranspose -> BatchNorm -> ReLU` is
+the standard Keras pattern, so every deconv-headed model hits this. Two lines in
+TFLite's `TransposeConvBuiltinOperationParser` (raise the version gate to 4, call the
+already-present `MaybeFuseActivation`) would fix all of them without any flatbuffer
+rewriting. Written up with the patch location in `flutter_litert`
+`doc/graph_shape_vs_delegate.md` finding 4. The rewrite here is the stopgap that works
+against the already-published 3.7.0.
+
 ### Round 8 status
 
 | candidate | size | NME_IOD (TFLite, 480 val) | latency (flutter_litert 3.7.0, 4t) | verdict |
@@ -1083,6 +1138,11 @@ architecture.
 | 4 deconv taper 128/96/64/48 | 10.17 MB | 8.754 level / 8.686 best | 14.4 ms | **trade, rejected** (1.97x faster for +0.15) |
 
 **Nothing from this round is currently shipped.** The baseline is untouched.
+
+The one large win found (section 8: unfusing the deconv ReLU, 26.83 ms to 5.11 ms at
+unchanged accuracy and size) is real and verified but blocked on a package-level
+decision, because it requires the GPU delegate and is 2.2x slower under XNNPACK. It is
+not an asset swap.
 
 Head-shape latency has been re-measured as dynamic exports on 3.7.0 (see the table
 in section 6), so the cheap-head candidates are judged against the 28.4 ms baseline
