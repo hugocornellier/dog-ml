@@ -988,11 +988,23 @@ alone, which makes it the right cheap test for head capacity specifically, at
 ~1 hour per candidate against ~6 hours for the full two-phase run. Baseline
 phase-1 reference is **10.574** (best at epoch 80, early-stopped at 87).
 
-| candidate | heatmap res | phase-1 best | vs baseline |
-|---|---|---|---|
-| baseline (uniform 128) | 192^2 | 10.5740 | -- |
-| **4 deconv 128/96/64/48** | 192^2 | **10.7152** | +0.141 |
-| 3 deconv uniform 128 | 96^2 | 10.7549 | +0.181 |
+| candidate | heatmap res | size | phase-1 best | vs baseline |
+|---|---|---|---|---|
+| baseline (uniform 128) | 192^2 | 11.02 MB | 10.5740 | -- |
+| **4 deconv 128/96/64/48** | 192^2 | 10.17 MB | **10.7152** | +0.141 |
+| 3 deconv uniform 128 | 96^2 | 10.52 MB | 10.7549 | +0.181 |
+| **4 deconv 192/96/64/48** | 192^2 | 12.23 MB | **10.6211** | **+0.047** |
+
+The last row is the only cheap head that is not clearly behind. It tests a different idea
+from the others: rather than removing capacity it *moves* it, widening `deconv_1`, which
+runs at 12x12 where capacity costs about 2.2 ms and which holds most of the head's
+parameters, while keeping the expensive high-resolution layers thin. At +0.047 against a
+~0.08 run-to-run noise floor it is indistinguishable from the baseline at phase 1.
+
+It was never given a full run, so it remains the one open Pareto candidate. Two cautions
+before anyone spends the ~7 hours: it is 12.23 MB against the baseline's 11.02, and the
+aggressive taper also looked acceptable at phase 1 (+0.141) before failing at +0.147 on
+last-30 means after phase 2. Phase-1 agreement is necessary, not sufficient.
 
 **Run-to-run noise floor, measured, read this before ranking anything above.**
 The full run re-trained the taper's phase 1 from the identical preset and seed and
@@ -1069,7 +1081,7 @@ state: **the deconv head is not over-parameterised.** Thinning channels costs ab
 ~0.08 phase-1 noise floor. Head cost cannot be bought down for free on this
 architecture.
 
-### 8. Unfusing the deconv ReLU makes the model GPU-delegatable (5.25x, not yet shipped)
+### 8. Unfusing the deconv ReLU makes the model GPU-delegatable (5.25x on an M4 Max, ~1% on a phone, NOT shipped)
 
 The one direction in this round that produced a large win, found after the Pareto
 work had otherwise concluded. It is a graph rewrite, not a retrain: same weights,
@@ -1116,6 +1128,11 @@ Also unverified: the 5.11 ms is an M4 Max GPU number, medians exclude 10 warmup
 invocations so host-to-device transfer is under-counted for single-shot use, and iOS
 has never actually run this graph on GPU (the delegate no-ops there today).
 
+**Superseded by section 9. Read that before acting on any number here.** Everything
+above is macOS on an M4 Max. Measured afterwards on an iPhone 15 Pro, the GPU delegate is
+worth about 1%, not 5.25x, and this whole direction is dead on the platform that actually
+uses the GPU.
+
 **The better fix is upstream of this repo.** `Conv2DTranspose -> BatchNorm -> ReLU` is
 the standard Keras pattern, so every deconv-headed model hits this. Two lines in
 TFLite's `TransposeConvBuiltinOperationParser` (raise the version gate to 4, call the
@@ -1123,6 +1140,68 @@ already-present `MaybeFuseActivation`) would fix all of them without any flatbuf
 rewriting. Written up with the patch location in `flutter_litert`
 `doc/graph_shape_vs_delegate.md` finding 4. The rewrite here is the stopgap that works
 against the already-published 3.7.0.
+
+### 9. On-device measurement, which overturned section 8
+
+Everything in sections 1 through 8 was measured on macOS with an M4 Max. That machine has
+40 GPU cores; an iPhone 15 Pro (A17 Pro) has 6. `InterpreterFactory` auto-mode picks
+XNNPACK on macOS and the GPU delegate only on iOS, so the Mac is the platform that matters
+least here and was the only one measured.
+
+Run on a physical iPhone 15 Pro via
+`dog_detection/example/integration_test/gpu_delegate_bench_test.dart`, median of 30
+invocations after 5 warmups, deviation taken against a no-delegate reference on the same
+fixed input:
+
+| variant | backend | median | dev vs CPU | verdict |
+|---|---|---|---|---|
+| dynamic (ships today) | none | 54.98 ms | -- | reference |
+| **dynamic (ships today)** | **xnnpack** | **47.82 ms** | 7.0e-06 | engaged |
+| dynamic (ships today) | gpu | 57.22 ms | **0.0** | NO-OP, bare CPU |
+| dynamic (ships today) | coreml | 57.92 ms | **0.0** | NO-OP, bare CPU |
+| static, v4 fused ReLU | gpu | 53.14 ms | 7.8e-07 | engaged |
+| static, v4 fused ReLU | coreml (patched) | 47.89 ms | 9.5e-04 | engaged |
+| static, ReLU unfused | gpu | **46.65 ms** | 3.5e-05 | engaged |
+| static, ReLU unfused | coreml (patched) | 56.29 ms | 8.9e-04 | engaged |
+
+**The GPU is worth about 1% on a phone, not 5.25x.** Best CPU is 47.82 ms, best GPU
+46.65 ms. The M4 Max GPU did 5.11 ms; the A17 Pro does 46.65. Roughly 9x, tracking the
+6.7x core-count difference. So the static export, the ReLU unfusing and the
+`TRANSPOSE_CONV` v4 patch, whose entire justification was the GPU path, buy nothing where
+it counts.
+
+Three compute units land within 2% of each other: XNNPACK 47.82, GPU 46.65, ANE 47.89.
+That pattern suggests the model is **memory-bandwidth bound on an A17 Pro** rather than
+compute bound, which also explains why 40 GPU cores reach 5.11 ms while 6 cores and an ANE
+both converge near 47.
+
+**iOS already accepts `TRANSPOSE_CONV` v4**, where the stock macOS delegate refuses it. So
+the v4 patch is macOS-only in value.
+
+**The one actionable result, and it needs no model change at all.** The shipped model under
+the GPU delegate is a silent no-op on iOS, deviation exactly 0.0. Since auto-mode sends iOS
+to GPU, the landmark stage runs on bare CPU *without* XNNPACK: 57.22 ms instead of 47.82.
+That is roughly 20% lost for nothing, and it matches the "17-23% latency, silently" that
+flutter_litert's `doc/delegate_verification.md` records for zero-op delegation. Fixing it
+is one line at the call site, using the per-stage `landmarkPerformanceConfig` override
+added to `dog_detection` and `cat_detection`:
+
+```dart
+DogDetector(landmarkPerformanceConfig: const PerformanceConfig.xnnpack(numThreads: 4))
+```
+
+`PerformanceMode.coreml` had the same shape of problem for a different reason: TFLite's
+CoreML delegate never compiled any model containing a `MEAN` op, because
+`PoolingLayerBuilder::Build()` returned before setting a required padding field. 7 of the 8
+models shipped across the three packages contain `MEAN`. Patched and verified in
+flutter_litert (`patches/coreml_mean_padding.patch`), which takes CoreML from no-op to
+engaged, but at 47.89 ms it only ties XNNPACK. Fixing it removes a silent regression rather
+than adding speed.
+
+**Method note worth keeping.** The deviation column is load-bearing, not the milliseconds. A
+delegate that attaches, claims zero ops and falls back to CPU looks exactly like a slow
+success. All three no-ops above were caught by comparing output against a CPU reference on
+an identical input, and by nothing else.
 
 ### Round 8 status
 
@@ -1139,10 +1218,14 @@ against the already-published 3.7.0.
 
 **Nothing from this round is currently shipped.** The baseline is untouched.
 
-The one large win found (section 8: unfusing the deconv ReLU, 26.83 ms to 5.11 ms at
-unchanged accuracy and size) is real and verified but blocked on a package-level
-decision, because it requires the GPU delegate and is 2.2x slower under XNNPACK. It is
-not an asset swap.
+Section 8's GPU result (26.83 ms to 5.11 ms) is real on an M4 Max and worth about 1% on
+an iPhone 15 Pro. See section 9. That direction is closed.
+
+What section 9 does leave is one change worth making, and it touches no model at all:
+routing the landmark stage to XNNPACK on iOS, where auto-mode currently picks a GPU
+delegate that is a silent no-op, costing roughly 20%. The per-stage override for it is
+committed in dog_detection and cat_detection; the default is deliberately unchanged
+pending wider device coverage.
 
 Head-shape latency has been re-measured as dynamic exports on 3.7.0 (see the table
 in section 6), so the cheap-head candidates are judged against the 28.4 ms baseline
