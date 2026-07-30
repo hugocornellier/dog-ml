@@ -30,7 +30,10 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bench_litert_macos import DYLIB, _bind  # noqa: E402
 
-COREML_DYLIB = DYLIB.parent / "libtensorflowlite_coreml-mac.dylib"
+import os as _os
+# Allow pointing at a patched build for before/after comparison.
+COREML_DYLIB = Path(_os.environ.get(
+    "COREML_DYLIB", str(DYLIB.parent / "libtensorflowlite_coreml-mac.dylib")))
 
 
 def try_coreml(model_path: Path, max_partitions: int = 0,
